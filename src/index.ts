@@ -1,6 +1,6 @@
 // opencode-bg-agents — async write-capable background agents + process
-// monitors for opencode. All limits configurable via BG_AGENTS_* environment
-// variables, read at plugin load (see README.md).
+// monitors for opencode. Configurable via bg-agents.json files / BG_AGENTS_*
+// environment variables, read at plugin load (see README.md).
 //
 // Agents:   bg_dispatch / bg_send / bg_status / bg_read / bg_cancel / bg_ask / bg_answer
 // Monitors: monitor_run / monitor_status / monitor_read / monitor_wait / monitor_kill
@@ -17,6 +17,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import * as fs from "node:fs/promises"
+import * as os from "node:os"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -70,15 +71,40 @@ interface Monitor {
   waiters: ((msg: string) => void)[]
 }
 
-function envInt(name: string, def: number): number {
-  const v = Number.parseInt(process.env[name] ?? "", 10)
-  return Number.isFinite(v) && v > 0 ? v : def
+// Values as read from a bg-agents.json file: all keys optional, unknown keys
+// ignored, coerced on use. (opencode.json itself is schema-strict, so plugin
+// config cannot live there.)
+type FileConfig = Record<string, unknown>
+
+async function readConfigFile(p: string): Promise<{ cfg: FileConfig; bad: boolean }> {
+  try {
+    const parsed = JSON.parse(await fs.readFile(p, "utf8"))
+    const ok = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+    return { cfg: ok ? parsed : {}, bad: !ok }
+  } catch (e: any) {
+    return { cfg: {}, bad: e?.code !== "ENOENT" }
+  }
 }
 
-function envBool(name: string, def: boolean): boolean {
-  const v = (process.env[name] ?? "").trim().toLowerCase()
-  if (v === "") return def
-  return !(v === "false" || v === "0" || v === "off" || v === "no")
+function cfgStr(env: string, vals: unknown[], def: string): string {
+  const e = (process.env[env] ?? "").trim()
+  if (e) return e
+  for (const v of vals) if (typeof v === "string" && v.trim()) return v.trim()
+  return def
+}
+
+function cfgNum(env: string, vals: unknown[], def: number): number {
+  const e = Number.parseInt(process.env[env] ?? "", 10)
+  if (Number.isFinite(e) && e > 0) return e
+  for (const v of vals) if (typeof v === "number" && Number.isFinite(v) && v > 0) return Math.floor(v)
+  return def
+}
+
+function cfgBool(env: string, vals: unknown[], def: boolean): boolean {
+  const e = (process.env[env] ?? "").trim().toLowerCase()
+  if (e) return !(e === "false" || e === "0" || e === "off" || e === "no")
+  for (const v of vals) if (typeof v === "boolean") return v
+  return def
 }
 
 function sanitizeTitle(s: string): string {
@@ -86,14 +112,6 @@ function sanitizeTitle(s: string): string {
 }
 
 export const BackgroundAgents: Plugin = async ({ client, directory }) => {
-  // Configuration (BG_AGENTS_* env vars, read once at plugin load).
-  const ORCHESTRATOR = (process.env.BG_AGENTS_ORCHESTRATOR ?? "").trim() || "orchestrator"
-  const MAX_CONCURRENT_TASKS = envInt("BG_AGENTS_MAX_CONCURRENT", 4)
-  const MAX_CONCURRENT_MONITORS = envInt("BG_AGENTS_MAX_MONITORS", 8)
-  const MAX_TASKS_PER_PARENT = envInt("BG_AGENTS_MAX_PER_SESSION", 50) // runaway-orchestrator circuit breaker
-  const QUESTION_TIMEOUT_MS = envInt("BG_AGENTS_QUESTION_TIMEOUT_SEC", 600) * 1000
-  const BLOCK_SLEEP = envBool("BG_AGENTS_BLOCK_SLEEP", true)
-
   const tasks = new Map<string, BgTask>()
   const questions = new Map<string, PendingQuestion>()
   const monitors = new Map<string, Monitor>()
@@ -109,6 +127,26 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
       await (client as any).tui?.showToast?.({ body: { message, variant } })
     } catch {}
   }
+
+  // Configuration, read once at plugin load. Precedence: BG_AGENTS_* env var
+  // > .opencode/bg-agents.json (project) > ~/.config/opencode/bg-agents.json
+  // (global) > built-in defaults.
+  const projectCfgPath = path.join(directory, ".opencode", "bg-agents.json")
+  const xdg = process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config")
+  const globalCfgPath = path.join(xdg, "opencode", "bg-agents.json")
+  const proj = await readConfigFile(projectCfgPath)
+  const glob = await readConfigFile(globalCfgPath)
+  for (const [p, bad] of [[projectCfgPath, proj.bad], [globalCfgPath, glob.bad]] as const) {
+    if (bad) toast(`bg-agents: ignoring invalid JSON in ${p}`, "error")
+  }
+  const ORCHESTRATOR = cfgStr("BG_AGENTS_ORCHESTRATOR", [proj.cfg.orchestrator, glob.cfg.orchestrator], "orchestrator")
+  const MAX_CONCURRENT_TASKS = cfgNum("BG_AGENTS_MAX_CONCURRENT", [proj.cfg.max_concurrent, glob.cfg.max_concurrent], 4)
+  const MAX_CONCURRENT_MONITORS = cfgNum("BG_AGENTS_MAX_MONITORS", [proj.cfg.max_monitors, glob.cfg.max_monitors], 8)
+  // runaway-orchestrator circuit breaker
+  const MAX_TASKS_PER_PARENT = cfgNum("BG_AGENTS_MAX_PER_SESSION", [proj.cfg.max_per_session, glob.cfg.max_per_session], 50)
+  const QUESTION_TIMEOUT_MS =
+    cfgNum("BG_AGENTS_QUESTION_TIMEOUT_SEC", [proj.cfg.question_timeout_sec, glob.cfg.question_timeout_sec], 600) * 1000
+  const BLOCK_SLEEP = cfgBool("BG_AGENTS_BLOCK_SLEEP", [proj.cfg.block_sleep, glob.cfg.block_sleep], true)
 
   // NOTE: session.prompt resolves only when the target session's whole turn
   // completes. Never await this from completion handlers; fire and forget.
@@ -281,7 +319,7 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
     if (lifetime >= MAX_TASKS_PER_PARENT) {
       throw new Error(
         `Lifetime dispatch cap (${MAX_TASKS_PER_PARENT}) reached for this session. ` +
-          `This is a runaway guard; raise BG_AGENTS_MAX_PER_SESSION if intentional.`,
+          `This is a runaway guard; raise max_per_session in .opencode/bg-agents.json if intentional.`,
       )
     }
 
@@ -631,7 +669,7 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
           if (name !== ORCHESTRATOR) {
             out.push(
               `NOTE: the plugin's configured orchestrator is "${ORCHESTRATOR}". ` +
-                `Set BG_AGENTS_ORCHESTRATOR=${name} to use "${name}".`,
+                `Add { "orchestrator": "${name}" } to .opencode/bg-agents.json to use "${name}".`,
             )
           }
 

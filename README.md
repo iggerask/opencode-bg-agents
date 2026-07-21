@@ -55,16 +55,35 @@ the snippet it returns to my <name> agents" — or do it manually:
 
 ## Configuration
 
-All via environment variables, read at plugin load:
+Defaults work out of the box. To change them, create `.opencode/bg-agents.json`
+in the project (commit it; per-project) and/or
+`~/.config/opencode/bg-agents.json` (global defaults). opencode's own
+`opencode.json` is schema-strict, so plugin settings cannot live there.
 
-| Variable | Default | Meaning |
+All keys are optional; unknown keys are ignored. Example:
+
+```json
+{
+  "orchestrator": "conductor",
+  "max_concurrent": 6,
+  "block_sleep": false
+}
+```
+
+| Key | Default | Meaning |
 |---|---|---|
-| `BG_AGENTS_ORCHESTRATOR` | `orchestrator` | Agent name allowed to dispatch/answer/cancel/send |
-| `BG_AGENTS_MAX_CONCURRENT` | `4` | Parallel background tasks |
-| `BG_AGENTS_MAX_MONITORS` | `8` | Parallel monitors |
-| `BG_AGENTS_MAX_PER_SESSION` | `50` | Lifetime dispatch cap per session (runaway guard) |
-| `BG_AGENTS_QUESTION_TIMEOUT_SEC` | `600` | `bg_ask` wait before proceeding on judgment |
-| `BG_AGENTS_BLOCK_SLEEP` | on | Set `false` to allow `sleep` in bash commands |
+| `orchestrator` | `"orchestrator"` | Agent name allowed to dispatch/answer/cancel/send |
+| `max_concurrent` | `4` | Parallel background tasks |
+| `max_monitors` | `8` | Parallel monitors |
+| `max_per_session` | `50` | Lifetime dispatch cap per session (runaway guard) |
+| `question_timeout_sec` | `600` | `bg_ask` wait before proceeding on judgment |
+| `block_sleep` | `true` | Set `false` to allow `sleep` in bash commands |
+
+Precedence: `BG_AGENTS_*` environment variable (`BG_AGENTS_ORCHESTRATOR`,
+`BG_AGENTS_MAX_CONCURRENT`, `BG_AGENTS_MAX_MONITORS`,
+`BG_AGENTS_MAX_PER_SESSION`, `BG_AGENTS_QUESTION_TIMEOUT_SEC`,
+`BG_AGENTS_BLOCK_SLEEP`) > project file > global file > defaults. Everything
+is read once at plugin load.
 
 ## Status files
 
