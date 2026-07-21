@@ -149,6 +149,7 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
   const tasks = new Map<string, BgTask>()
   const questions = new Map<string, PendingQuestion>()
   const monitors = new Map<string, Monitor>()
+  const loggedParts = new Set<string>() // tool calls already written to status files
   const bgDir = path.join(directory, ".opencode", "bg")
   await fs.mkdir(bgDir, { recursive: true })
 
@@ -321,6 +322,26 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
         if (role === "assistant") {
           const text = extractText(m)
           if (text) return text
+        }
+      }
+    } catch {}
+    return undefined
+  }
+
+  // Latest tool call of a session, e.g. "bash: npm test (running)" — the
+  // same signal the TUI's subagent view shows inline for task-tool subagents.
+  async function currentActivity(sessionID: string): Promise<string | undefined> {
+    try {
+      const res: any = await (client.session as any).messages({ path: { id: sessionID } })
+      const msgs: any[] = res?.data ?? res ?? []
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const parts = msgs[i]?.parts ?? []
+        for (let j = parts.length - 1; j >= 0; j--) {
+          const p = parts[j]
+          if (p?.type === "tool" && p.state?.status && p.state.status !== "pending") {
+            const title = p.state.title ? `: ${p.state.title}` : ""
+            return `${p.tool}${title} (${p.state.status})`
+          }
         }
       }
     } catch {}
@@ -664,6 +685,26 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
         }
       }
 
+      // Live activity feed: each finished tool call of a running bg task is
+      // appended to its status file (once per call; the file becomes a live
+      // log without relying on the agent to write it).
+      if (type === "message.part.updated") {
+        const part = event?.properties?.part
+        const partSid = part?.sessionID ?? event?.properties?.sessionID
+        const status = part?.state?.status
+        if (part?.type === "tool" && partSid && (status === "completed" || status === "error")) {
+          const task = taskForSession(partSid)
+          if (task && task.state === "running" && !loggedParts.has(part.id)) {
+            loggedParts.add(part.id)
+            const title = part.state?.title ? `: ${part.state.title}` : ""
+            appendStatus(
+              task.id,
+              `- ${new Date().toISOString()} TOOL ${status === "error" ? "ERROR" : "DONE"} ${part.tool}${title}`,
+            )
+          }
+        }
+      }
+
       // Kill monitors owned by deleted sessions.
       if (type === "session.deleted" && sid) {
         stopMonitorsOwnedBy(sid)
@@ -687,6 +728,21 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
     // child's next tool result, landing in its context within seconds without
     // waiting for (or triggering) a new turn.
     "tool.execute.after": async (input: any, output: any) => {
+      // Forward-compat with native subagent rendering: bg_dispatch parts carry
+      // the same session references the TUI's task view looks for.
+      if (input?.tool === "bg_dispatch" && output) {
+        const m = /Dispatched (bg_\w+)/.exec(output.output ?? "")
+        const t = m ? tasks.get(m[1]) : undefined
+        if (t) {
+          output.metadata = {
+            ...(output.metadata ?? {}),
+            sessionId: t.sessionID,
+            parentSessionId: t.parentSessionID,
+            background: true,
+          }
+        }
+      }
+
       const task = taskForSession(input?.sessionID)
       if (!task || task.state !== "running") return
       const undelivered = task.inbox.filter((m) => !m.delivered)
@@ -892,14 +948,15 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
           const pending = [...questions.values()]
             .map((q) => `${q.id} pending from ${q.taskID}: ${q.question}`)
             .join("\n")
-          return (
-            list
-              .map(
-                (t) =>
-                  `${t.id} [${t.state}] "${t.title}" agent=${t.agent} started ${t.startedAt}${t.endedAt ? `, ended ${t.endedAt}` : ""}`,
-              )
-              .join("\n") + (pending ? `\n\nUnanswered questions:\n${pending}` : "")
+          const lines = await Promise.all(
+            list.map(async (t) => {
+              const base = `${t.id} [${t.state}] "${t.title}" agent=${t.agent} started ${t.startedAt}${t.endedAt ? `, ended ${t.endedAt}` : ""}`
+              if (t.state !== "running") return base
+              const activity = await currentActivity(t.sessionID)
+              return activity ? `${base}\n  ↳ ${activity}` : base
+            }),
           )
+          return lines.join("\n") + (pending ? `\n\nUnanswered questions:\n${pending}` : "")
         },
       }),
 

@@ -104,8 +104,16 @@ not, and `bg_status`/`bg_read` fall back to disk for unknown ids.
 ## In the UI
 
 - **Session list** (`/sessions`): every background task is a child session of
-  the orchestrator — open one to watch the agent work live. Titles carry
-  status: `⏳ bg: <title>` running, `❓` question pending, then `✓` / `✗` / `⊘`.
+  the orchestrator. Titles carry status: `⏳ bg: <title>` running, `❓`
+  question pending, then `✓` / `✗` / `⊘`.
+- **Watch an agent live**: from the orchestrator session, `ctrl+x ↓` jumps
+  into the first child session (full live transcript, same as task-tool
+  subagents); `←`/`→` cycle between siblings, `↑` returns to the parent. Only
+  sessions dispatched after install have this link.
+- **Live activity without switching**: `bg_status` (and `/bg`) shows each
+  running task's current tool call (`↳ bash: npm test (running)`), and the
+  plugin appends `TOOL DONE/ERROR` lines to the task's status file as it
+  works — `.opencode/bg/bg_<id>.md` is a live log.
 - **Toasts**: dispatch, questions, completion, and cancellation raise TUI
   toasts; questions linger 30s (the asking agent is frozen until answered).
 - **`/bg` command**: installed by `bg_setup` — a dashboard of tasks and
