@@ -23,7 +23,8 @@ Add the plugin to your `opencode.json`:
 { "plugin": ["opencode-bg-agents@latest"] }
 ````
 
-Then:
+Then either let an agent set the project up for you — "run bg_setup, then apply
+the snippet it returns to my <name> agents" — or do it manually:
 
 1. Create `.opencode/agent/orchestrator.md` from
    [`templates/orchestrator.md`](templates/orchestrator.md).
@@ -32,10 +33,13 @@ Then:
    specialist agent that should run in the background.
 3. Add `.opencode/bg/` to your project `.gitignore`.
 
+`bg_setup` is idempotent and never overwrites existing agent definitions.
+
 ## Tools
 
 | Tool | Available to | Purpose |
 |---|---|---|
+| `bg_setup(orchestrator_name?)` | all (ungated bootstrap) | One-time setup: write the orchestrator agent definition, gitignore `.opencode/bg/`, return the specialist snippet |
 | `bg_dispatch(title, prompt, agent)` | orchestrator | Spawn a specialist in a background session; non-blocking |
 | `bg_send(id, message)` | orchestrator | Push context to a running task; delivered on its next tool result |
 | `bg_answer(id, answer)` | orchestrator | Answer a pending `[bg question]` |

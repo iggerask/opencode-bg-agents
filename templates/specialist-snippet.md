@@ -5,6 +5,7 @@ background:
 
     mode: all
     tools:
+      bg_setup: false
       bg_dispatch: false
       bg_answer: false
       bg_cancel: false

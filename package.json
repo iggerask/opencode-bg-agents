@@ -4,6 +4,7 @@
   "description": "Write-capable async background agents, orchestrator Q&A, and process monitors for opencode",
   "main": "src/index.ts",
   "type": "module",
+  "files": ["src", "templates"],
   "keywords": ["opencode", "opencode-plugin", "background-agents"],
   "license": "MIT",
   "repository": "github:iggerask/opencode-bg-agents",

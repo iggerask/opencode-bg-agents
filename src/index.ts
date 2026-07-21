@@ -18,6 +18,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
+import { fileURLToPath } from "node:url"
 
 type TaskState = "registered" | "running" | "done" | "error" | "cancelled"
 type MonState = "running" | "done" | "killed" | "timeout"
@@ -591,6 +592,73 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
     },
 
     tool: {
+      // ---- setup -----------------------------------------------------------
+
+      // One-time bootstrap; deliberately NOT gated on the orchestrator
+      // (chicken-and-egg), but idempotent and non-destructive.
+      bg_setup: tool({
+        description:
+          "One-time project setup for background agents: writes the orchestrator " +
+          "agent definition to .opencode/agent/, ensures .opencode/bg/ is in " +
+          ".gitignore, and returns the snippet to apply to each specialist " +
+          "agent. Idempotent; existing agent definitions are never overwritten.",
+        args: {
+          orchestrator_name: tool.schema
+            .string()
+            .optional()
+            .describe(`Agent filename to create (default: ${ORCHESTRATOR})`),
+        },
+        async execute(args: any) {
+          const name = args.orchestrator_name ?? ORCHESTRATOR
+          // Filename only; a path here would escape .opencode/agent/.
+          if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+            return `Invalid orchestrator_name "${name}" (letters, digits, _ and - only).`
+          }
+          const templatesDir = fileURLToPath(new URL("../templates/", import.meta.url))
+          const out: string[] = []
+
+          const dest = path.join(directory, ".opencode", "agent", `${name}.md`)
+          let created = false
+          try {
+            await fs.access(dest)
+          } catch {
+            const tpl = await fs.readFile(path.join(templatesDir, "orchestrator.md"), "utf8")
+            await fs.mkdir(path.dirname(dest), { recursive: true })
+            await fs.writeFile(dest, tpl)
+            created = true
+          }
+          out.push(created ? `Created ${dest}.` : `${dest} already exists; left untouched.`)
+          if (name !== ORCHESTRATOR) {
+            out.push(
+              `NOTE: the plugin's configured orchestrator is "${ORCHESTRATOR}". ` +
+                `Set BG_AGENTS_ORCHESTRATOR=${name} to use "${name}".`,
+            )
+          }
+
+          // Install step 3: keep task/monitor state files out of git.
+          try {
+            const giPath = path.join(directory, ".gitignore")
+            const gi = await fs.readFile(giPath, "utf8").catch(() => "")
+            if (!gi.split("\n").some((l) => l.trim() === ".opencode/bg/")) {
+              await fs.appendFile(giPath, `${gi === "" || gi.endsWith("\n") ? "" : "\n"}.opencode/bg/\n`)
+              out.push("Added .opencode/bg/ to .gitignore.")
+            }
+          } catch {}
+
+          const snippet = await fs.readFile(
+            path.join(templatesDir, "specialist-snippet.md"),
+            "utf8",
+          )
+          out.push(
+            "",
+            "Apply the following to each specialist agent definition, then restart opencode:",
+            "",
+            snippet,
+          )
+          return out.join("\n")
+        },
+      }),
+
       // ---- background agents ----------------------------------------------
 
       bg_dispatch: tool({
