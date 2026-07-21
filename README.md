@@ -33,13 +33,20 @@ the snippet it returns to my <name> agents" — or do it manually:
    specialist agent that should run in the background.
 3. Add `.opencode/bg/` to your project `.gitignore`.
 
-`bg_setup` is idempotent and never overwrites existing agent definitions.
+`bg_setup` is idempotent and never overwrites existing content. If the
+orchestrator agent file already exists, the delegation protocol is merged in
+as a marked `<!-- opencode-bg-agents:begin/end -->` block — frontmatter and
+your own instructions are preserved, and re-running `bg_setup` after a plugin
+update refreshes just that block. Already have a main agent you want to keep?
+Point bg_setup at it: `bg_setup(orchestrator_name: "<your-agent>")`, and set
+`orchestrator` in `.opencode/bg-agents.json` to the same name. Pass
+`append: false` to leave existing files untouched.
 
 ## Tools
 
 | Tool | Available to | Purpose |
 |---|---|---|
-| `bg_setup(orchestrator_name?)` | all (ungated bootstrap) | One-time setup: write the orchestrator agent definition, gitignore `.opencode/bg/`, return the specialist snippet |
+| `bg_setup(orchestrator_name?, append?)` | all (ungated bootstrap) | One-time setup: write the orchestrator agent definition (or merge it into an existing agent), gitignore `.opencode/bg/`, return the specialist snippet |
 | `bg_dispatch(title, prompt, agent)` | orchestrator | Spawn a specialist in a background session; non-blocking |
 | `bg_send(id, message)` | orchestrator | Push context to a running task; delivered on its next tool result |
 | `bg_answer(id, answer)` | orchestrator | Answer a pending `[bg question]` |

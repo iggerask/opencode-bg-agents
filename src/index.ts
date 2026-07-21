@@ -111,6 +111,40 @@ function sanitizeTitle(s: string): string {
   return s.replace(/[\r\n]+/g, " ").replace(/---/g, "___").slice(0, 80)
 }
 
+const ORCH_BEGIN = "<!-- opencode-bg-agents:begin -->"
+const ORCH_END = "<!-- opencode-bg-agents:end -->"
+
+// Split an agent template into YAML frontmatter and prompt body. The body is
+// what gets merged into existing agent definitions.
+function templateParts(tpl: string): { fm: string; body: string } {
+  const m = tpl.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/)
+  return {
+    fm: m ? m[0].trimEnd() : "",
+    body: (m ? tpl.slice(m[0].length) : tpl).trim(),
+  }
+}
+
+// Add or replace the marked orchestration block in an existing agent file.
+// Content outside the markers is preserved verbatim, so re-runs are
+// idempotent and can refresh the block after plugin template updates.
+function mergeOrchestratorBlock(
+  existing: string,
+  body: string,
+): { text: string; action: "added" | "refreshed" | "current" } {
+  const block = `${ORCH_BEGIN}\n${body}\n${ORCH_END}`
+  const start = existing.indexOf(ORCH_BEGIN)
+  const end = existing.indexOf(ORCH_END)
+  if (start >= 0 && end > start) {
+    const text = existing.slice(0, start) + block + existing.slice(end + ORCH_END.length)
+    return { text, action: text === existing ? "current" : "refreshed" }
+  }
+  // Migrate files written before markers existed: wrap the unmarked body.
+  if (existing.includes(body)) {
+    return { text: existing.replace(body, block), action: "refreshed" }
+  }
+  return { text: existing.trimEnd() + "\n\n" + block + "\n", action: "added" }
+}
+
 export const BackgroundAgents: Plugin = async ({ client, directory }) => {
   const tasks = new Map<string, BgTask>()
   const questions = new Map<string, PendingQuestion>()
@@ -637,14 +671,24 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
       bg_setup: tool({
         description:
           "One-time project setup for background agents: writes the orchestrator " +
-          "agent definition to .opencode/agent/, ensures .opencode/bg/ is in " +
-          ".gitignore, and returns the snippet to apply to each specialist " +
-          "agent. Idempotent; existing agent definitions are never overwritten.",
+          "agent definition to .opencode/agent/ (or merges the orchestration " +
+          "protocol into an existing agent as a marked, updatable block), " +
+          "ensures .opencode/bg/ is in .gitignore, and returns the snippet to " +
+          "apply to each specialist agent. Idempotent; never overwrites " +
+          "existing content.",
         args: {
           orchestrator_name: tool.schema
             .string()
             .optional()
-            .describe(`Agent filename to create (default: ${ORCHESTRATOR})`),
+            .describe(`Agent filename to create or merge into (default: ${ORCHESTRATOR})`),
+          append: tool.schema
+            .boolean()
+            .optional()
+            .describe(
+              "If the agent file already exists: merge the orchestration protocol " +
+                "in as a marked block, refreshed on re-runs (default: true). " +
+                "Set false to leave existing files untouched.",
+            ),
         },
         async execute(args: any) {
           const name = args.orchestrator_name ?? ORCHESTRATOR
@@ -655,17 +699,40 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
           const templatesDir = fileURLToPath(new URL("../templates/", import.meta.url))
           const out: string[] = []
 
+          const tpl = await fs.readFile(path.join(templatesDir, "orchestrator.md"), "utf8")
+          const { fm, body } = templateParts(tpl)
           const dest = path.join(directory, ".opencode", "agent", `${name}.md`)
-          let created = false
+          let existing: string | undefined
           try {
-            await fs.access(dest)
-          } catch {
-            const tpl = await fs.readFile(path.join(templatesDir, "orchestrator.md"), "utf8")
+            existing = await fs.readFile(dest, "utf8")
+          } catch {}
+          if (existing === undefined) {
             await fs.mkdir(path.dirname(dest), { recursive: true })
-            await fs.writeFile(dest, tpl)
-            created = true
+            await fs.writeFile(dest, `${fm ? fm + "\n" : ""}${ORCH_BEGIN}\n${body}\n${ORCH_END}\n`)
+            out.push(`Created ${dest}.`)
+          } else if (args.append ?? true) {
+            const { text, action } = mergeOrchestratorBlock(existing, body)
+            if (action === "current") {
+              out.push(`${dest} already contains the orchestration block; up to date.`)
+            } else {
+              await fs.writeFile(dest, text)
+              out.push(
+                action === "added"
+                  ? `Appended the orchestration protocol to ${dest} as a marked block ` +
+                      "(re-run bg_setup after plugin updates to refresh it)."
+                  : `Refreshed the marked orchestration block in ${dest}.`,
+              )
+              out.push(
+                "Frontmatter was left untouched. The standalone template sets " +
+                  "`mode: primary` and `permission: edit: deny`; review whether " +
+                  "those fit this agent.",
+              )
+            }
+          } else {
+            out.push(
+              `${dest} already exists; left untouched (pass append: true to merge in the orchestration protocol).`,
+            )
           }
-          out.push(created ? `Created ${dest}.` : `${dest} already exists; left untouched.`)
           if (name !== ORCHESTRATOR) {
             out.push(
               `NOTE: the plugin's configured orchestrator is "${ORCHESTRATOR}". ` +
