@@ -1,0 +1,16 @@
+{
+  "name": "opencode-bg-agents",
+  "version": "0.1.0",
+  "description": "Write-capable async background agents, orchestrator Q&A, and process monitors for opencode",
+  "main": "src/index.ts",
+  "type": "module",
+  "keywords": ["opencode", "opencode-plugin", "background-agents"],
+  "license": "MIT",
+  "repository": "github:iggerask/opencode-bg-agents",
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": { "optional": true }
+  }
+}

@@ -1,0 +1,98 @@
+# opencode-bg-agents
+
+Claude Code-style asynchronous background agents for [opencode](https://opencode.ai):
+write-capable specialists running in parallel sessions, an orchestrator that gets
+woken on completion, bidirectional Q&A, mid-task context push, and process
+monitors that replace sleep-polling.
+
+## How it works
+
+`bg_dispatch` spawns a specialist agent in a standalone session with its full
+permissions (including write/edit/bash) and returns immediately. Completion,
+errors, and questions are injected back into the orchestrator's session as
+tagged messages (`[bg done]`, `[bg error]`, `[bg question]`). Each task owns a
+status file under `.opencode/bg/` with a progress log the agent appends to as
+it works. Monitors run shell commands in the background and wake the calling
+agent on exit or on an output regex match, so agents never poll with `sleep`.
+
+## Install
+
+Add the plugin to your `opencode.json`:
+
+````json
+{ "plugin": ["opencode-bg-agents@latest"] }
+````
+
+Then:
+
+1. Create `.opencode/agent/orchestrator.md` from
+   [`templates/orchestrator.md`](templates/orchestrator.md).
+2. Add the frontmatter and prompt block from
+   [`templates/specialist-snippet.md`](templates/specialist-snippet.md) to each
+   specialist agent that should run in the background.
+3. Add `.opencode/bg/` to your project `.gitignore`.
+
+## Tools
+
+| Tool | Available to | Purpose |
+|---|---|---|
+| `bg_dispatch(title, prompt, agent)` | orchestrator | Spawn a specialist in a background session; non-blocking |
+| `bg_send(id, message)` | orchestrator | Push context to a running task; delivered on its next tool result |
+| `bg_answer(id, answer)` | orchestrator | Answer a pending `[bg question]` |
+| `bg_status(id?)` | all | Task states and unanswered questions |
+| `bg_read(id)` | all | Final output, or current status file while running |
+| `bg_cancel(id)` | orchestrator | Abort a running task; stops its monitors |
+| `bg_ask(question)` | background agents | Block until the orchestrator answers (timeout: proceed with judgment) |
+| `monitor_run(command, wake_pattern?, timeout_sec?)` | all | Background command; wake on exit or output match |
+| `monitor_status(id?)` | all | Monitor states |
+| `monitor_read(id, tail?)` | all | Live log tail |
+| `monitor_wait(id, timeout_sec?)` | all | Block on the real event instead of sleep loops |
+| `monitor_kill(id)` | all | Kill a monitor's process |
+
+## Configuration
+
+All via environment variables, read at plugin load:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BG_AGENTS_ORCHESTRATOR` | `orchestrator` | Agent name allowed to dispatch/answer/cancel/send |
+| `BG_AGENTS_MAX_CONCURRENT` | `4` | Parallel background tasks |
+| `BG_AGENTS_MAX_MONITORS` | `8` | Parallel monitors |
+| `BG_AGENTS_MAX_PER_SESSION` | `50` | Lifetime dispatch cap per session (runaway guard) |
+| `BG_AGENTS_QUESTION_TIMEOUT_SEC` | `600` | `bg_ask` wait before proceeding on judgment |
+| `BG_AGENTS_BLOCK_SLEEP` | on | Set `false` to allow `sleep` in bash commands |
+
+## Status files
+
+`.opencode/bg/bg_<id>.md` per task: YAML frontmatter (state, sessions, timing),
+an append-only `## Progress` log written by the agent, and a `## Result` or
+`## Error` section on completion. Monitor logs stream to
+`.opencode/bg/mon_<id>.log`. Files survive restarts; in-memory task state does
+not, and `bg_status`/`bg_read` fall back to disk for unknown ids.
+
+## Compatibility
+
+Developed against opencode 1.18.4 (end-to-end verification pending). Version-sensitive points:
+the `session.messages` API name, `session.idle`/`session.error` event payload
+shape, and `tool.execute.after` output mutation. If completion detection or
+message delivery misbehaves on your version, file an issue with your opencode
+version and one raw event log line.
+
+## Caveats
+
+- Monitors are killed on opencode shutdown, with best-effort process-tree kills
+  (`setsid` on Linux, direct child kill elsewhere). Use `exec`-style commands
+  for processes that must die reliably.
+- `bg_send` delivery rides on the child's next tool call; if the child finishes
+  first, the completion notice reports the undelivered count.
+- Plugin notifications arrive as user-role messages. The orchestrator template
+  instructs the model to treat tagged `<bg_output>` content as data and never
+  relay it verbatim between agents. Read those rules before pointing background
+  agents at untrusted content.
+- Two write-capable agents with overlapping file scopes will race; the
+  orchestrator template forbids it. For hard isolation, dispatch into separate
+  git worktrees.
+
+## License
+
+MIT
