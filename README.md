@@ -46,7 +46,7 @@ Point bg_setup at it: `bg_setup(orchestrator_name: "<your-agent>")`, and set
 
 | Tool | Available to | Purpose |
 |---|---|---|
-| `bg_setup(orchestrator_name?, append?)` | all (ungated bootstrap) | One-time setup: write the orchestrator agent definition (or merge it into an existing agent), gitignore `.opencode/bg/`, return the specialist snippet |
+| `bg_setup(orchestrator_name?, append?)` | all (ungated bootstrap) | One-time setup: write the orchestrator agent definition (or merge it into an existing agent), install the `/bg` command, gitignore `.opencode/bg/`, return the specialist snippet |
 | `bg_dispatch(title, prompt, agent)` | orchestrator | Spawn a specialist in a background session; non-blocking |
 | `bg_send(id, message)` | orchestrator | Push context to a running task; delivered on its next tool result |
 | `bg_answer(id, answer)` | orchestrator | Answer a pending `[bg question]` |
@@ -85,12 +85,13 @@ All keys are optional; unknown keys are ignored. Example:
 | `max_per_session` | `50` | Lifetime dispatch cap per session (runaway guard) |
 | `question_timeout_sec` | `600` | `bg_ask` wait before proceeding on judgment |
 | `block_sleep` | `true` | Set `false` to allow `sleep` in bash commands |
+| `toasts` | `true` | Lifecycle toasts (dispatch/question/done/error/cancel) |
 
 Precedence: `BG_AGENTS_*` environment variable (`BG_AGENTS_ORCHESTRATOR`,
 `BG_AGENTS_MAX_CONCURRENT`, `BG_AGENTS_MAX_MONITORS`,
 `BG_AGENTS_MAX_PER_SESSION`, `BG_AGENTS_QUESTION_TIMEOUT_SEC`,
-`BG_AGENTS_BLOCK_SLEEP`) > project file > global file > defaults. Everything
-is read once at plugin load.
+`BG_AGENTS_BLOCK_SLEEP`, `BG_AGENTS_TOASTS`) > project file > global file >
+defaults. Everything is read once at plugin load.
 
 ## Status files
 
@@ -99,6 +100,18 @@ an append-only `## Progress` log written by the agent, and a `## Result` or
 `## Error` section on completion. Monitor logs stream to
 `.opencode/bg/mon_<id>.log`. Files survive restarts; in-memory task state does
 not, and `bg_status`/`bg_read` fall back to disk for unknown ids.
+
+## In the UI
+
+- **Session list** (`/sessions`): every background task is a child session of
+  the orchestrator — open one to watch the agent work live. Titles carry
+  status: `⏳ bg: <title>` running, `❓` question pending, then `✓` / `✗` / `⊘`.
+- **Toasts**: dispatch, questions, completion, and cancellation raise TUI
+  toasts; questions linger 30s (the asking agent is frozen until answered).
+- **`/bg` command**: installed by `bg_setup` — a dashboard of tasks and
+  monitors; `/bg <id>` reads one.
+- Because tasks are child sessions, completion also fires the TUI's native
+  `subagent_done` attention event (sound/desktop notification).
 
 ## Compatibility
 

@@ -124,10 +124,10 @@ function templateParts(tpl: string): { fm: string; body: string } {
   }
 }
 
-// Add or replace the marked orchestration block in an existing agent file.
-// Content outside the markers is preserved verbatim, so re-runs are
-// idempotent and can refresh the block after plugin template updates.
-function mergeOrchestratorBlock(
+// Add or replace the marked managed block in an existing file. Content
+// outside the markers is preserved verbatim, so re-runs are idempotent and
+// can refresh the block after plugin template updates.
+function mergeManagedBlock(
   existing: string,
   body: string,
 ): { text: string; action: "added" | "refreshed" | "current" } {
@@ -156,9 +156,14 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
 
   // ---------------------------------------------------------------- shared
 
-  async function toast(message: string, variant: "success" | "error" | "info" = "info") {
+  async function toast(
+    message: string,
+    variant: "success" | "error" | "info" | "warning" = "info",
+    title?: string,
+    duration?: number,
+  ) {
     try {
-      await (client as any).tui?.showToast?.({ body: { message, variant } })
+      await (client as any).tui?.showToast?.({ body: { message, variant, title, duration } })
     } catch {}
   }
 
@@ -181,6 +186,37 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
   const QUESTION_TIMEOUT_MS =
     cfgNum("BG_AGENTS_QUESTION_TIMEOUT_SEC", [proj.cfg.question_timeout_sec, glob.cfg.question_timeout_sec], 600) * 1000
   const BLOCK_SLEEP = cfgBool("BG_AGENTS_BLOCK_SLEEP", [proj.cfg.block_sleep, glob.cfg.block_sleep], true)
+  const TOASTS = cfgBool("BG_AGENTS_TOASTS", [proj.cfg.toasts, glob.cfg.toasts], true)
+
+  // Ambient lifecycle notifications for the human (dispatch/question/done/
+  // error). Diagnostics (config errors, delivery failures) bypass this gate.
+  function lifecycle(message: string, variant: "success" | "error" | "info" | "warning", duration?: number) {
+    if (TOASTS) toast(message, variant, "bg agents", duration)
+  }
+
+  // The TUI session list is the dashboard: bg sessions are children of the
+  // orchestrator session, and their titles carry live status glyphs.
+  const STATE_GLYPH: Record<TaskState, string> = {
+    registered: "⏳",
+    running: "⏳",
+    done: "✓",
+    error: "✗",
+    cancelled: "⊘",
+  }
+
+  function taskTitle(t: BgTask): string {
+    const questionPending = [...questions.values()].some((q) => q.taskID === t.id)
+    const glyph = t.state === "running" && questionPending ? "❓" : STATE_GLYPH[t.state]
+    return `${glyph} bg: ${t.title}`
+  }
+
+  function syncTitle(t: BgTask) {
+    try {
+      ;((client.session as any).update?.({ path: { id: t.sessionID }, body: { title: taskTitle(t) } }) as any)?.catch(
+        () => {},
+      )
+    } catch {}
+  }
 
   // NOTE: session.prompt resolves only when the target session's whole turn
   // completes. Never await this from completion handlers; fire and forget.
@@ -313,6 +349,7 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
     task.endedAt = new Date().toISOString()
     task.output = finalOutput
     task.error = error
+    syncTitle(task)
     stopMonitorsOwnedBy(task.sessionID) // no orphaned dev servers / zombie turns
     dropTaskQuestions(
       task.id,
@@ -325,12 +362,14 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
         ? `\n\nNOTE: ${undelivered} bg_send message(s) were never delivered (the task made no further tool calls). It did not see them.`
         : ""
     if (ok) {
+      lifecycle(`[bg done] ${task.id} ("${task.title}")`, "success")
       notifySession(
         task.parentSessionID,
         `[bg done] ${task.id} ("${task.title}") finished. Full output via bg_read("${task.id}").${undeliveredNote}\n\n` +
           wrapOutput(task.output ? task.output.slice(-1500) : "(no text output)"),
       )
     } else {
+      lifecycle(`[bg error] ${task.id} ("${task.title}"): ${task.error}`, "error")
       notifySession(
         task.parentSessionID,
         `[bg error] ${task.id} ("${task.title}") failed: ${task.error}.${undeliveredNote} Decide whether to retry via bg_dispatch.`,
@@ -357,7 +396,9 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
       )
     }
 
-    const session = await client.session.create({ body: { title: `bg: ${title}` } })
+    const session = await client.session.create({
+      body: { title: `${STATE_GLYPH.running} bg: ${title}`, parentID: parentSessionID },
+    })
     const sessionID = (session as any).data?.id ?? (session as any).id
     const id = `bg_${sessionID.slice(-8)}`
 
@@ -673,9 +714,9 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
           "One-time project setup for background agents: writes the orchestrator " +
           "agent definition to .opencode/agent/ (or merges the orchestration " +
           "protocol into an existing agent as a marked, updatable block), " +
-          "ensures .opencode/bg/ is in .gitignore, and returns the snippet to " +
-          "apply to each specialist agent. Idempotent; never overwrites " +
-          "existing content.",
+          "installs the /bg dashboard command, ensures .opencode/bg/ is in " +
+          ".gitignore, and returns the snippet to apply to each specialist " +
+          "agent. Idempotent; never overwrites existing content.",
         args: {
           orchestrator_name: tool.schema
             .string()
@@ -711,7 +752,7 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
             await fs.writeFile(dest, `${fm ? fm + "\n" : ""}${ORCH_BEGIN}\n${body}\n${ORCH_END}\n`)
             out.push(`Created ${dest}.`)
           } else if (args.append ?? true) {
-            const { text, action } = mergeOrchestratorBlock(existing, body)
+            const { text, action } = mergeManagedBlock(existing, body)
             if (action === "current") {
               out.push(`${dest} already contains the orchestration block; up to date.`)
             } else {
@@ -750,6 +791,32 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
             }
           } catch {}
 
+          // /bg dashboard command. Never merged into foreign files, but
+          // refreshed in place while it carries our markers.
+          const cmdTpl = await fs.readFile(path.join(templatesDir, "bg-command.md"), "utf8")
+          const cmd = templateParts(cmdTpl)
+          const cmdDest = path.join(directory, ".opencode", "command", "bg.md")
+          let cmdExisting: string | undefined
+          try {
+            cmdExisting = await fs.readFile(cmdDest, "utf8")
+          } catch {}
+          if (cmdExisting === undefined) {
+            await fs.mkdir(path.dirname(cmdDest), { recursive: true })
+            await fs.writeFile(
+              cmdDest,
+              `${cmd.fm ? cmd.fm + "\n" : ""}${ORCH_BEGIN}\n${cmd.body}\n${ORCH_END}\n`,
+            )
+            out.push(`Created ${cmdDest} (type /bg for the dashboard, /bg <id> to read one).`)
+          } else if (cmdExisting.includes(ORCH_BEGIN)) {
+            const { text, action } = mergeManagedBlock(cmdExisting, cmd.body)
+            if (action !== "current") {
+              await fs.writeFile(cmdDest, text)
+              out.push(`Refreshed the marked block in ${cmdDest}.`)
+            }
+          } else {
+            out.push(`${cmdDest} already exists (not written by bg_setup); left untouched.`)
+          }
+
           const snippet = await fs.readFile(
             path.join(templatesDir, "specialist-snippet.md"),
             "utf8",
@@ -779,6 +846,7 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
         async execute(args: any, ctx: any) {
           if (ctx.agent !== ORCHESTRATOR) return `bg_dispatch is ${ORCHESTRATOR}-only.`
           const t = await dispatch(args.title, args.prompt, args.agent, ctx.sessionID)
+          lifecycle(`[bg dispatch] ${t.id} ("${t.title}", agent=${t.agent})`, "info")
           return `Dispatched ${t.id} ("${t.title}", agent=${t.agent}). Non-blocking; continue other work.`
         },
       }),
@@ -863,6 +931,8 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
           if (t.state !== "running") return `Task ${args.id} already ${t.state}.`
           t.state = "cancelled"
           t.endedAt = new Date().toISOString()
+          syncTitle(t)
+          lifecycle(`[bg cancelled] ${t.id} ("${t.title}")`, "warning")
           stopMonitorsOwnedBy(t.sessionID) // abort does not fire session.deleted
           dropTaskQuestions(t.id, "(Task cancelled by orchestrator.)")
           try {
@@ -900,6 +970,8 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
               resolve,
               timer,
             })
+            syncTitle(task)
+            lifecycle(`[bg question] from ${task.id} ("${task.title}") — answer with bg_answer`, "warning", 30000)
             notifySession(
               task.parentSessionID,
               `[bg question ${qid}] from ${task.id} ("${task.title}"):\n\n${wrapOutput(args.question)}\n\nAnswer with bg_answer("${qid}", "..."). It is blocked until you do.`,
@@ -916,6 +988,7 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
               }
             })
           })
+          syncTitle(task) // question resolved (answer, timeout, or task end): back to running glyph
           await appendStatus(task.id, `- ${new Date().toISOString()} ANSWERED: ${answer}`)
           return answer
         },
