@@ -195,8 +195,7 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
     if (TOASTS) toast(message, variant, "bg agents", duration)
   }
 
-  // The TUI session list is the dashboard: bg sessions are children of the
-  // orchestrator session, and their titles carry live status glyphs.
+  // The TUI session list displays bg sessions with status glyphs in their titles.
   const STATE_GLYPH: Record<TaskState, string> = {
     registered: "⏳",
     running: "⏳",
@@ -418,7 +417,7 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
     }
 
     const session = await client.session.create({
-      body: { title: `${STATE_GLYPH.running} bg: ${title}`, parentID: parentSessionID },
+      body: { title: `${STATE_GLYPH.running} bg: ${title}` },
     })
     const sessionID = (session as any).data?.id ?? (session as any).id
     const id = `bg_${sessionID.slice(-8)}`
