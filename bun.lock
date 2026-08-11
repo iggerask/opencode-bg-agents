@@ -8,11 +8,8 @@
         "@opencode-ai/plugin": "1.18.4",
       },
       "peerDependencies": {
-        "@opencode-ai/plugin": "*",
+        "@opencode-ai/plugin": ">=1.0.0",
       },
-      "optionalPeers": [
-        "@opencode-ai/plugin",
-      ],
     },
   },
   "packages": {
