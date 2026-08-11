@@ -9,7 +9,7 @@
   "license": "MIT",
   "repository": "github:iggerask/opencode-bg-agents",
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.0.0"
+    "@opencode-ai/plugin": ">=1.18.4"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "1.18.4"

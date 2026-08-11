@@ -8,7 +8,7 @@
         "@opencode-ai/plugin": "1.18.4",
       },
       "peerDependencies": {
-        "@opencode-ai/plugin": ">=1.0.0",
+        "@opencode-ai/plugin": ">=1.18.4",
       },
     },
   },

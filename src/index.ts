@@ -186,6 +186,11 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
   const MAX_TASKS_PER_PARENT = cfgNum("BG_AGENTS_MAX_PER_SESSION", [proj.cfg.max_per_session, glob.cfg.max_per_session], 50)
   const QUESTION_TIMEOUT_MS =
     cfgNum("BG_AGENTS_QUESTION_TIMEOUT_SEC", [proj.cfg.question_timeout_sec, glob.cfg.question_timeout_sec], 600) * 1000
+  // A child whose model/provider is unreachable never starts a turn at all:
+  // the prompt request blocks, no session.idle/error ever fires, and the task
+  // would sit at "running" forever. Fail it once it is clear nothing started.
+  const DISPATCH_STALL_MS =
+    cfgNum("BG_AGENTS_STALL_TIMEOUT_SEC", [proj.cfg.stall_timeout_sec, glob.cfg.stall_timeout_sec], 90) * 1000
   const BLOCK_SLEEP = cfgBool("BG_AGENTS_BLOCK_SLEEP", [proj.cfg.block_sleep, glob.cfg.block_sleep], true)
   const TOASTS = cfgBool("BG_AGENTS_TOASTS", [proj.cfg.toasts, glob.cfg.toasts], true)
 
@@ -245,6 +250,49 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
       .filter((p: any) => p.type === "text")
       .map((p: any) => p.text)
       .join("\n")
+  }
+
+  // The SDK resolves with { error } on HTTP failures instead of rejecting, so
+  // every call that matters has to inspect the result rather than rely on catch.
+  function sdkError(result: any): string | undefined {
+    const err = result?.error
+    if (!err) return undefined
+    const msg = err?.data?.message ?? err?.message ?? err?.name
+    return typeof msg === "string"
+      ? msg.replace(/\s+/g, " ").trim()
+      : JSON.stringify(err).slice(0, 300)
+  }
+
+  // An agent with its own configured model keeps it — that choice is
+  // deliberate (cheaper models for specialists, and so on) and dispatching
+  // must not quietly override it.
+  async function agentConfiguresModel(agent: string): Promise<boolean> {
+    try {
+      const res: any = await (client as any).config.get({})
+      const cfg = res?.data ?? res
+      return Boolean(cfg?.agent?.[agent]?.model)
+    } catch {
+      return false
+    }
+  }
+
+  // Otherwise the child inherits whatever default the server picks, which may
+  // be a provider the user never configured for this agent: the request then
+  // blocks forever and the task sits at "running" with no output. Fall back to
+  // the model the orchestrator itself is running on.
+  async function sessionModel(
+    sessionID: string,
+  ): Promise<{ providerID: string; modelID: string } | undefined> {
+    try {
+      const res: any = await client.session.get({ path: { id: sessionID } })
+      const m = res?.data?.model ?? res?.model
+      // Sessions report the model as { id, providerID }; prompts want modelID.
+      const modelID = m?.modelID ?? m?.id
+      if (typeof modelID === "string" && typeof m?.providerID === "string") {
+        return { providerID: m.providerID, modelID }
+      }
+    } catch {}
+    return undefined
   }
 
   // ------------------------------------------------------ background agents
@@ -308,6 +356,29 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
         clearTimeout(q.timer)
         q.resolve(reason)
       }
+    }
+  }
+
+  // True once the child has actually produced something. Message count alone
+  // is not enough: an assistant message is created up front and stays empty
+  // (no parts, zero tokens) for the whole turn when its provider never
+  // responds, which is exactly the case we need to catch.
+  async function sessionProducedOutput(sessionID: string): Promise<boolean> {
+    try {
+      const res: any = await (client.session as any).messages({ path: { id: sessionID } })
+      const msgs: any[] = res?.data ?? res ?? []
+      return msgs.some((m: any) => {
+        const info = m?.info ?? m
+        if (info?.role !== "assistant") return false
+        const tokens = info?.tokens ?? {}
+        return (
+          (m?.parts?.length ?? 0) > 0 ||
+          Boolean(info?.time?.completed) ||
+          (tokens.input ?? 0) + (tokens.output ?? 0) + (tokens.reasoning ?? 0) > 0
+        )
+      })
+    } catch {
+      return true // never fail a task on a failed probe
     }
   }
 
@@ -416,10 +487,16 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
       )
     }
 
+    const model = (await agentConfiguresModel(agent))
+      ? undefined
+      : await sessionModel(parentSessionID)
     const session = await client.session.create({
       body: { title: `${STATE_GLYPH.running} bg: ${title}` },
     })
+    const createError = sdkError(session)
+    if (createError) throw new Error(`Could not create background session: ${createError}`)
     const sessionID = (session as any).data?.id ?? (session as any).id
+    if (!sessionID) throw new Error("Could not create background session: no session id returned.")
     const id = `bg_${sessionID.slice(-8)}`
 
     const task: BgTask = {
@@ -455,13 +532,36 @@ export const BackgroundAgents: Plugin = async ({ client, directory }) => {
     client.session
       .prompt({
         path: { id: sessionID },
-        body: { agent, parts: [{ type: "text", text: fullPrompt }] },
+        body: { agent, ...(model ? { model } : {}), parts: [{ type: "text", text: fullPrompt }] },
       })
-      .then((result: any) => finishTask(task, true, extractText(result)))
+      .then((result: any) => {
+        // A rejected prompt never starts a turn, so no session.idle/error will
+        // ever arrive to finish this task. Surface it instead of leaving the
+        // task pinned at "running" (or, worse, reporting an empty success).
+        const error = sdkError(result)
+        if (error) return finishTask(task, false, undefined, `dispatch rejected: ${error}`)
+        return finishTask(task, true, extractText(result))
+      })
       .catch(() => {
         // Do NOT mark error here: the request failing does not mean the
         // session failed. Let session.idle/session.error decide.
       })
+
+    const stall = setTimeout(async () => {
+      if (task.state !== "running" || (await sessionProducedOutput(task.sessionID))) return
+      // Report the child's own model rather than the one we asked for: when
+      // the agent configures its own, that is what actually ran.
+      const actual = (await sessionModel(task.sessionID)) ?? model
+      const where = actual ? `${actual.providerID}/${actual.modelID}` : `the ${agent} agent's model`
+      await finishTask(
+        task,
+        false,
+        undefined,
+        `never started: no response from ${where} within ${Math.round(DISPATCH_STALL_MS / 1000)}s. ` +
+          `Its provider is likely unreachable or misconfigured.`,
+      )
+    }, DISPATCH_STALL_MS)
+    ;(stall as any)?.unref?.()
 
     return task
   }

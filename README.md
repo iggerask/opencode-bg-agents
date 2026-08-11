@@ -84,14 +84,15 @@ All keys are optional; unknown keys are ignored. Example:
 | `max_monitors` | `8` | Parallel monitors |
 | `max_per_session` | `50` | Lifetime dispatch cap per session (runaway guard) |
 | `question_timeout_sec` | `600` | `bg_ask` wait before proceeding on judgment |
+| `stall_timeout_sec` | `90` | Fail a dispatch whose agent produced nothing by then (unreachable provider) |
 | `block_sleep` | `true` | Set `false` to allow `sleep` in bash commands |
 | `toasts` | `true` | Lifecycle toasts (dispatch/question/done/error/cancel) |
 
 Precedence: `BG_AGENTS_*` environment variable (`BG_AGENTS_ORCHESTRATOR`,
 `BG_AGENTS_MAX_CONCURRENT`, `BG_AGENTS_MAX_MONITORS`,
 `BG_AGENTS_MAX_PER_SESSION`, `BG_AGENTS_QUESTION_TIMEOUT_SEC`,
-`BG_AGENTS_BLOCK_SLEEP`, `BG_AGENTS_TOASTS`) > project file > global file >
-defaults. Everything is read once at plugin load.
+`BG_AGENTS_STALL_TIMEOUT_SEC`, `BG_AGENTS_BLOCK_SLEEP`, `BG_AGENTS_TOASTS`) >
+project file > global file > defaults. Everything is read once at plugin load.
 
 ## Status files
 
