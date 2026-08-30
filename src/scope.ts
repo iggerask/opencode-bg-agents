@@ -79,8 +79,14 @@ export async function canonicalizeWriteRoot(
   if (relativeResolved === ".." || relativeResolved.startsWith(`..${path.sep}`) || path.isAbsolute(relativeResolved)) {
     throw new ScopeError(`write root escapes the worktree through a symlink: ${value}`)
   }
-  // Retain a stable, lexical project-relative representation for SQLite leases.
-  return relative
+  const protectedPaths = await Promise.all(
+    [".git", protectedRoot].map((protectedRelative) => realPathForCandidate(root, protectedRelative)),
+  )
+  if (protectedPaths.some((protectedPath) => isWithinPhysical(protectedPath, resolved) || isWithinPhysical(resolved, protectedPath))) {
+    throw new ScopeError(`write root is protected: ${value}`)
+  }
+  // Lease identities must use the physical path so symlink aliases conflict.
+  return relativeResolved === "" ? "." : asPosix(relativeResolved)
 }
 
 /** Canonicalize, sort, de-duplicate, and remove roots covered by another root. */

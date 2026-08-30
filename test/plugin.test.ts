@@ -10,6 +10,9 @@ afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) awai
 
 async function setup(options: any = {}) {
   const fixture = await pluginFixture(); cleanups.push(fixture.cleanup)
+  // 1.18.25 exposes the ID and role under message.info.  Every normal native
+  // child has at least its initial user turn.
+  fixture.client.session.messages = async () => ({ data: [{ info: { id: "initial-turn", role: "user" }, parts: [] }] })
   const hooks: any = await BackgroundAgents({ client: fixture.client, directory: fixture.root, worktree: fixture.root } as any, { notifications: false, __backgroundSubagents: true, ...options })
   cleanups.push(async () => hooks.dispose())
   return { ...fixture, hooks, ctx: context("root", fixture.root, "orchestrator", fixture.calls) }
@@ -118,8 +121,18 @@ describe("native orchestration plugin", () => {
     const native = argsFrom(await hooks.tool.orch_prepare.execute({ title: "diff", prompt: "diff", agent: "implement", write_roots: ["src"] }, ctx))
     await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "diff" }, { args: native })
     await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "diff", args: native }, { output: "", metadata: nativeMetadata("diff-child") })
-    client.session.diff = async () => ({ data: [{ file: "src/a.ts", before: "", after: "x", additions: 1, deletions: 0 }] })
+    const diffQueries: any[] = []
+    client.session.messages = async () => ({ data: [
+      { info: { id: "initial-turn", role: "user" }, parts: [] },
+      { info: { id: "continuation-turn", role: "user" }, parts: [] },
+      { info: { id: "assistant-turn", role: "assistant" }, parts: [] },
+    ] })
+    client.session.diff = async (input: any) => {
+      diffQueries.push(input)
+      return { data: input.query.messageID === "initial-turn" ? [{ file: "src/a.ts", before: "", after: "x", additions: 1, deletions: 0 }] : [] }
+    }
     expect(await hooks.tool.orch_complete.execute({ status: "done", summary: "ok", files_changed: ["src/a.ts"] }, context("diff-child", ctx.worktree, "implement"))).toContain("completed")
+    expect(diffQueries.map((item) => item.query.messageID)).toEqual(["initial-turn", "continuation-turn"])
 
     const malformed = argsFrom(await hooks.tool.orch_prepare.execute({ title: "bad diff", prompt: "bad diff", agent: "implement", write_roots: ["src/b"] }, ctx))
     await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "bad-diff" }, { args: malformed })
@@ -128,6 +141,156 @@ describe("native orchestration plugin", () => {
     expect(await hooks.tool.orch_complete.execute({ status: "done", summary: "no", files_changed: [] }, context("bad-diff-child", ctx.worktree, "implement"))).toContain("returned an error")
     client.session.diff = async () => ({ data: [{ file: 42 }] })
     expect(await hooks.tool.orch_complete.execute({ status: "done", summary: "bad", files_changed: [] }, context("bad-diff-child", ctx.worktree, "implement"))).toContain("malformed file entry")
+  })
+
+  test("rejects an empty changed-file claim when a message-scoped authoritative diff exists", async () => {
+    const { hooks, ctx, client } = await setup()
+    const native = argsFrom(await hooks.tool.orch_prepare.execute({ title: "honest diff", prompt: "diff", agent: "implement", write_roots: ["src"] }, ctx))
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "diff" }, { args: native })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "diff", args: native }, { output: "", metadata: nativeMetadata("honest-child") })
+    client.session.diff = async (input: any) => {
+      expect(input).toEqual({ path: { id: "honest-child" }, query: { messageID: "initial-turn" } })
+      return { data: [{ file: "src/a.ts" }] }
+    }
+    expect(await hooks.tool.orch_complete.execute({ status: "done", summary: "nothing", files_changed: [] }, context("honest-child", ctx.worktree, "implement"))).toContain("does not match")
+  })
+
+  test("cancellation before child linkage records and aborts the returned child", async () => {
+    const { hooks, ctx, calls } = await setup()
+    const native = argsFrom(await hooks.tool.orch_prepare.execute({ title: "link race", prompt: "race", agent: "implement", write_roots: ["src"] }, ctx))
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "race" }, { args: native })
+    expect(await hooks.tool.orch_cancel.execute({ id: native.command.split(":")[1] }, ctx)).toContain("Cancelled")
+    expect(text(await hooks.tool.orch_status.execute({ id: native.command.split(":")[1] }, ctx))).toContain("leases=src")
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "race", args: native }, { output: "", metadata: nativeMetadata("late-child") })
+    expect(calls.abort).toEqual(["late-child"])
+    await expect(hooks["tool.execute.before"]({ tool: "write", sessionID: "late-child", callID: "late" }, { args: { filePath: "src/a.ts" } })).rejects.toThrow("cancelled")
+  })
+
+  test("root cancellation releases an after-hook-resolved indeterminate dispatch", async () => {
+    const { hooks, ctx } = await setup()
+    const native = argsFrom(await hooks.tool.orch_prepare.execute({ title: "indeterminate", prompt: "indeterminate", agent: "implement", write_roots: ["src"] }, ctx))
+    const id = native.command.split(":")[1]
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "indeterminate" }, { args: native })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "indeterminate", args: native }, { output: "", metadata: { error: "native endpoint failed after accepting dispatch" } })
+    expect(text(await hooks.tool.orch_status.execute({ id }, ctx))).toContain("[interrupted]")
+    expect(text(await hooks.tool.orch_status.execute({ id }, ctx))).toContain("leases=src")
+    expect(await hooks.tool.orch_cancel.execute({ id }, ctx)).toContain("Cancelled")
+    expect(text(await hooks.tool.orch_status.execute({ id }, ctx))).toContain("leases=-")
+  })
+
+  test("error metadata links and aborts a parent-authenticated child, retrying resolved abort errors", async () => {
+    const { hooks, ctx, client, calls } = await setup()
+    let attempts = 0
+    client.session.abort = async ({ path }: any) => {
+      calls.abort.push(path.id)
+      attempts += 1
+      return attempts === 1 ? { error: { message: "abort unavailable" } } : undefined
+    }
+    const native = argsFrom(await hooks.tool.orch_prepare.execute({ title: "error child", prompt: "error", agent: "implement", write_roots: ["src"] }, ctx))
+    const id = native.command.split(":")[1]
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "error-child" }, { args: native })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "error-child", args: native }, { output: "", metadata: { ...nativeMetadata("error-child"), error: "native failed after child creation" } })
+    expect(calls.abort).toEqual(["error-child"])
+    expect(text(await hooks.tool.orch_status.execute({ id }, ctx))).toContain("native=error-child")
+    expect(text(await hooks.tool.orch_status.execute({ id }, ctx))).toContain("leases=src")
+    await expect(hooks["tool.execute.before"]({ tool: "write", sessionID: "error-child", callID: "late-write" }, { args: { filePath: "src/a.ts" } })).rejects.toThrow("interrupted")
+    expect(await hooks.tool.orch_cancel.execute({ id }, ctx)).toContain("Cancelled")
+    expect(calls.abort).toEqual(["error-child", "error-child"])
+    expect(text(await hooks.tool.orch_status.execute({ id }, ctx))).toContain("leases=-")
+  })
+
+  test("error metadata never trusts a child whose parent session does not match", async () => {
+    const { hooks, ctx, calls } = await setup()
+    const native = argsFrom(await hooks.tool.orch_prepare.execute({ title: "foreign error child", prompt: "error", agent: "implement", write_roots: ["src"] }, ctx))
+    const id = native.command.split(":")[1]
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "foreign-error" }, { args: native })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "foreign-error", args: native }, { output: "", metadata: { ...nativeMetadata("foreign-child"), parentSessionId: "other-root", error: "failed" } })
+    expect(calls.abort).toEqual([])
+    expect(text(await hooks.tool.orch_status.execute({ id }, ctx))).not.toContain("native=foreign-child")
+    expect(await hooks.tool.orch_cancel.execute({ id }, ctx)).toContain("Cancelled")
+    expect(text(await hooks.tool.orch_status.execute({ id }, ctx))).toContain("leases=-")
+  })
+
+  test("malformed metadata never aborts a session from another parent", async () => {
+    const { hooks, ctx, calls } = await setup()
+    const native = argsFrom(await hooks.tool.orch_prepare.execute({ title: "foreign malformed child", prompt: "malformed", agent: "implement", write_roots: ["src"] }, ctx))
+    const id = native.command.split(":")[1]
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "foreign-malformed" }, { args: native })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "foreign-malformed", args: native }, { output: "", metadata: { ...nativeMetadata("foreign-malformed-child"), parentSessionId: "other-root" } })
+    expect(calls.abort).toEqual([])
+    expect(text(await hooks.tool.orch_status.execute({ id }, ctx))).not.toContain("native=foreign-malformed-child")
+    expect(await hooks.tool.orch_cancel.execute({ id }, ctx)).toContain("Cancelled")
+    expect(text(await hooks.tool.orch_status.execute({ id }, ctx))).toContain("leases=-")
+  })
+
+  test("a cancelled linked child retries a failed abort and releases its retained lease", async () => {
+    const { hooks, ctx, client, calls } = await setup()
+    let attempts = 0
+    client.session.abort = async ({ path }: any) => {
+      calls.abort.push(path.id)
+      attempts += 1
+      if (attempts === 1) return { error: { message: "transient abort failure" } }
+    }
+    const native = argsFrom(await hooks.tool.orch_prepare.execute({ title: "retry cancel", prompt: "cancel", agent: "implement", write_roots: ["src"] }, ctx))
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "retry-cancel" }, { args: native })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "retry-cancel", args: native }, { output: "", metadata: nativeMetadata("retry-child") })
+    const id = native.command.split(":")[1]
+    expect(await hooks.tool.orch_cancel.execute({ id }, ctx)).toContain("Cancelled")
+    expect(text(await hooks.tool.orch_status.execute({ id }, ctx))).toContain("leases=src")
+    expect(await hooks.tool.orch_cancel.execute({ id }, ctx)).toContain("retry succeeded")
+    expect(calls.abort).toEqual(["retry-child", "retry-child"])
+    expect(text(await hooks.tool.orch_status.execute({ id }, ctx))).toContain("leases=-")
+    expect(await hooks.tool.orch_cancel.execute({ id }, ctx)).toContain("already cancelled")
+  })
+
+  test("blocks writes from blocked, failed, and interrupted native children", async () => {
+    const { hooks, ctx } = await setup()
+    const native = argsFrom(await hooks.tool.orch_prepare.execute({ title: "terminal writes", prompt: "terminal", agent: "implement", write_roots: ["src"] }, ctx))
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "terminal" }, { args: native })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "terminal", args: native }, { output: "", metadata: nativeMetadata("terminal-child") })
+    expect(await hooks.tool.orch_complete.execute({ status: "failed", summary: "failed" }, context("terminal-child", ctx.worktree, "implement"))).toContain("failed")
+    await expect(hooks["tool.execute.before"]({ tool: "write", sessionID: "terminal-child", callID: "failed" }, { args: { filePath: "src/a.ts" } })).rejects.toThrow("failed")
+    await hooks.event({ event: { type: "session.deleted", properties: { sessionID: "terminal-child" } } })
+    // Failed is already terminal; use an independently interrupted child too.
+    const second = argsFrom(await hooks.tool.orch_prepare.execute({ title: "interrupted writes", prompt: "interrupt", agent: "implement", write_roots: ["lib"] }, ctx))
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "interrupt" }, { args: second })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "interrupt", args: second }, { output: "", metadata: nativeMetadata("interrupted-child") })
+    await hooks.event({ event: { type: "session.deleted", properties: { sessionID: "interrupted-child" } } })
+    await expect(hooks["tool.execute.before"]({ tool: "write", sessionID: "interrupted-child", callID: "interrupted" }, { args: { filePath: "lib/a.ts" } })).rejects.toThrow("interrupted")
+    const blocked = argsFrom(await hooks.tool.orch_prepare.execute({ title: "blocked writes", prompt: "blocked", agent: "implement", write_roots: ["docs"] }, ctx))
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "blocked" }, { args: blocked })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "blocked", args: blocked }, { output: "", metadata: nativeMetadata("blocked-child") })
+    expect(await hooks.tool.orch_complete.execute({ status: "blocked", summary: "need input" }, context("blocked-child", ctx.worktree, "implement"))).toContain("blocked")
+    await expect(hooks["tool.execute.before"]({ tool: "write", sessionID: "blocked-child", callID: "blocked" }, { args: { filePath: "docs/a.ts" } })).rejects.toThrow("blocked")
+  })
+
+  test("no-ID orch_start revisits a dependency-blocked task after a continuation recovers its dependency", async () => {
+    const { hooks, ctx } = await setup()
+    const prerequisite = argsFrom(await hooks.tool.orch_prepare.execute({ title: "prerequisite", prompt: "base", agent: "implement", write_roots: ["base"] }, ctx))
+    const dependent = await hooks.tool.orch_prepare.execute({ title: "dependent", prompt: "child", agent: "implement", write_roots: ["child"], depends_on: [prerequisite.command.split(":")[1]] }, ctx)
+    expect(argsFrom(dependent).queued).toBe(true)
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "base" }, { args: prerequisite })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "base", args: prerequisite }, { output: "", metadata: nativeMetadata("base-child") })
+    expect(await hooks.tool.orch_complete.execute({ status: "failed", summary: "retry me" }, context("base-child", ctx.worktree, "implement"))).toContain("failed")
+    expect(await hooks.tool.orch_start.execute({}, ctx)).toContain("waiting")
+    const resumed = argsFrom(await hooks.tool.orch_continue.execute({ id: prerequisite.command.split(":")[1], message: "retry" }, ctx))
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "resume" }, { args: resumed })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "resume", args: resumed }, { output: "", metadata: nativeMetadata("base-child") })
+    expect(await hooks.tool.orch_complete.execute({ status: "done", summary: "recovered", files_changed: [] }, context("base-child", ctx.worktree, "implement"))).toContain("completed")
+    expect(argsFrom(await hooks.tool.orch_start.execute({}, ctx)).description).toBe("dependent")
+  })
+
+  test("monitor events inject an untrusted-data wake-up into their owner session", async () => {
+    const { hooks, ctx, client } = await setup()
+    const prompts: any[] = []
+    client.session.prompt = async (input: any) => { prompts.push(input) }
+    const started = await hooks.tool.monitor_run.execute({ command: "printf ready", wake_pattern: "ready" }, ctx)
+    const id = /mon_[A-Za-z0-9_-]+/.exec(text(started))![0]
+    await hooks.tool.monitor_wait.execute({ id, timeout_sec: 2 }, ctx)
+    await Promise.resolve()
+    expect(prompts[0]).toMatchObject({ path: { id: "root" }, body: { parts: [{ type: "text" }] } })
+    expect(prompts[0].body.noReply).toBeUndefined()
+    expect(prompts[0].body.parts[0].text).toContain("untrusted data")
   })
 
   test("completion is idempotent and reports cancellation that wins delayed validation", async () => {

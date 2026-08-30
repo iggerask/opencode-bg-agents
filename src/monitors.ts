@@ -64,6 +64,13 @@ interface LiveMonitor {
   stopNotify: boolean
   timeoutTimer?: ReturnType<typeof setTimeout>
   killTimer?: ReturnType<typeof setTimeout>
+  /** Completes after a stopped Linux process group has had its kill grace period. */
+  stopCleanup?: Promise<void>
+  /** Bypasses the grace period during disposal or failed start cleanup. */
+  forceEscalate?: () => void
+  leaderExited: boolean
+  processGroupGone: boolean
+  settled: boolean
   pumps: Promise<void>[]
   waiters: Set<Waiter>
   terminal: Promise<void>
@@ -173,22 +180,53 @@ export class ProcessSupervisor {
       hasProcessGroup: Boolean(setsid),
       wakeRegex,
       stopNotify: true,
+      leaderExited: false,
+      processGroupGone: !setsid,
+      settled: false,
       pumps: [],
       waiters: new Set(),
       terminal,
       finish,
     }
     this.monitors.set(id, monitor)
-    await this.writeMetadata(record)
-
     monitor.pumps = [this.pump(proc.stdout as ReadableStream<Uint8Array> | null, monitor), this.pump(proc.stderr as ReadableStream<Uint8Array> | null, monitor)]
-    void proc.exited.then(async (code) => {
-      await Promise.allSettled(monitor.pumps)
-      await this.complete(monitor, monitor.stopState ?? "done", code)
+    // Keep a rejection observed immediately; observeExit still waits for both
+    // pumps with allSettled to preserve as much log output as possible.
+    for (const pump of monitor.pumps) void pump.catch(() => {})
+    // Attach process ownership before any fallible persistence. In particular,
+    // an unwritable sidecar must not leave an unobserved child behind.
+    void proc.exited.then(
+      (code) => this.observeExit(monitor, code),
+      () => this.observeExit(monitor, -1),
+    ).catch(() => {
+      // complete() is deliberately defensive, but never let lifecycle work
+      // become an unhandled rejection if a runtime stream behaves unexpectedly.
     })
     if (options.timeoutSec && options.timeoutSec > 0) {
       monitor.timeoutTimer = setTimeout(() => this.requestStop(monitor, "timeout", true), options.timeoutSec * 1000)
       ;(monitor.timeoutTimer as any).unref?.()
+    }
+    try {
+      await this.writeMetadata(record)
+    } catch (error) {
+      // Lifecycle observation is already installed. Escalate immediately and
+      // bound the wait so a failed start can never make dispose hang.
+      // The leader can win the race and complete before this failed write is
+      // observed, while a redirected descendant is still in its group. Do not
+      // gate this cleanup on record.state for that reason.
+      monitor.stopState ??= "killed"
+      monitor.stopNotify = false
+      this.killProcess(monitor, "SIGTERM")
+      if (monitor.hasProcessGroup) this.beginGroupCleanup(monitor)
+      else if (!monitor.killTimer) {
+        monitor.killTimer = setTimeout(() => this.killProcess(monitor, "SIGKILL"), 1000)
+        ;(monitor.killTimer as any).unref?.()
+      }
+      this.forceStop(monitor)
+      await Promise.race([monitor.terminal, this.delay(1500)])
+      if (!monitor.settled) await this.complete(monitor, "killed", -1)
+      this.monitors.delete(id)
+      throw error
     }
     return this.copy(record)
   }
@@ -302,10 +340,8 @@ export class ProcessSupervisor {
       this.clearTimer(monitor.timeoutTimer)
       if (monitor.record.state === "running") {
         this.requestStop(monitor, "killed", false)
-        this.killProcess(monitor, "SIGKILL")
+        this.forceStop(monitor)
       }
-      this.clearTimer(monitor.killTimer)
-      monitor.killTimer = undefined
       this.settleWaiters(monitor, "disposed")
     }
     await Promise.allSettled(live.map((monitor) => monitor.terminal))
@@ -398,7 +434,9 @@ export class ProcessSupervisor {
     monitor.stopState ??= state
     monitor.stopNotify &&= notify
     this.killProcess(monitor, "SIGTERM")
-    if (!monitor.killTimer) {
+    if (monitor.hasProcessGroup) {
+      this.beginGroupCleanup(monitor)
+    } else if (!monitor.killTimer) {
       monitor.killTimer = setTimeout(() => this.killProcess(monitor, "SIGKILL"), 1000)
       ;(monitor.killTimer as any).unref?.()
     }
@@ -407,21 +445,28 @@ export class ProcessSupervisor {
   private killProcess(monitor: LiveMonitor, signal: "SIGTERM" | "SIGKILL"): void {
     const pid = monitor.proc.pid
     // Negative PIDs address the group only when Linux setsid created it.
-    if (process.platform === "linux" && monitor.hasProcessGroup) {
+    if (process.platform === "linux" && monitor.hasProcessGroup && !monitor.processGroupGone) {
       try {
         process.kill(-pid, signal)
         return
-      } catch {}
+      } catch (error: any) {
+        if (error?.code === "ESRCH") monitor.processGroupGone = true
+      }
     }
+    // Once the leader has exited, signaling its numeric PID can target an
+    // unrelated process. Group signaling above remains safe until ESRCH.
+    if (monitor.leaderExited) return
     try {
       monitor.proc.kill(signal)
     } catch {}
   }
 
   private async complete(monitor: LiveMonitor, state: TerminalMonitorState, exitCode: number): Promise<void> {
-    if (monitor.record.state !== "running") return
+    if (monitor.settled) return
+    monitor.settled = true
     this.clearTimer(monitor.timeoutTimer)
     this.clearTimer(monitor.killTimer)
+    monitor.killTimer = undefined
     monitor.record.state = state
     monitor.record.exitCode = exitCode
     monitor.record.endedAt = Date.now()
@@ -435,6 +480,103 @@ export class ProcessSupervisor {
       if (!this.disposed && monitor.stopNotify) await this.emit("completed", monitor)
       monitor.finish()
     }
+  }
+
+  private async observeExit(monitor: LiveMonitor, exitCode: number): Promise<void> {
+    monitor.leaderExited = true
+    // A shell can legitimately exit while leaving a background job in the
+    // setsid group. Treat that as a group cleanup event even without an
+    // explicit stop request; otherwise a redirected child is invisible to the
+    // output pumps and outlives a seemingly completed monitor.
+    if (!monitor.stopCleanup && monitor.hasProcessGroup && !monitor.processGroupGone) {
+      // Signal directly instead of probing first. A probe followed by a signal
+      // leaves an avoidable window in which a vacated PGID can be reused.
+      this.killProcess(monitor, "SIGTERM")
+      if (!monitor.processGroupGone) this.beginGroupCleanup(monitor)
+    }
+    const pumps = Promise.allSettled(monitor.pumps)
+    // Do not mistake a shell exiting after SIGTERM for its setsid group being
+    // gone: background descendants may have redirected both output pipes.
+    await monitor.stopCleanup
+    // SIGKILL normally closes the pipes immediately. Bound this last log drain
+    // after a forced group stop so an abnormal stream cannot hold dispose
+    // forever; the pumps remain observed and may still preserve late output.
+    if (monitor.stopCleanup) await Promise.race([pumps, this.delay(250)])
+    else await pumps
+    await this.complete(monitor, monitor.stopState ?? "done", exitCode)
+  }
+
+  private beginGroupCleanup(monitor: LiveMonitor): void {
+    if (monitor.stopCleanup) return
+    let escalate!: () => void
+    const escalation = new Promise<void>((resolve) => {
+      escalate = resolve
+    })
+    const trigger = () => {
+      this.clearTimer(monitor.killTimer)
+      monitor.killTimer = undefined
+      monitor.forceEscalate = undefined
+      escalate()
+    }
+    monitor.forceEscalate = trigger
+    monitor.killTimer = setTimeout(trigger, 1000)
+    ;(monitor.killTimer as any).unref?.()
+    monitor.stopCleanup = (async () => {
+      // Most SIGTERM-responsive groups disappear immediately. Poll during the
+      // grace period so ordinary completion does not pay the full escalation
+      // delay, while forceEscalate can still bypass it during disposal.
+      const goneBeforeEscalation = await Promise.race([
+        this.waitForGroupGone(monitor, 1000),
+        escalation.then(() => false),
+      ])
+      if (goneBeforeEscalation) {
+        this.clearTimer(monitor.killTimer)
+        monitor.killTimer = undefined
+        monitor.forceEscalate = undefined
+        return
+      }
+      this.killProcess(monitor, "SIGKILL")
+      // SIGKILL is asynchronous. Wait briefly so callers returning from a
+      // stop/dispose do not leave runnable descendants behind, but never hang
+      // forever on an unkillable process or a platform anomaly.
+      await this.waitForGroupGone(monitor, 250)
+    })()
+  }
+
+  private forceStop(monitor: LiveMonitor): void {
+    if (monitor.hasProcessGroup) {
+      monitor.forceEscalate?.()
+      this.killProcess(monitor, "SIGKILL")
+    } else {
+      this.clearTimer(monitor.killTimer)
+      monitor.killTimer = undefined
+      this.killProcess(monitor, "SIGKILL")
+    }
+  }
+
+  private processGroupExists(monitor: LiveMonitor): boolean {
+    if (!monitor.hasProcessGroup || monitor.processGroupGone) return false
+    try {
+      process.kill(-monitor.proc.pid, 0)
+      return true
+    } catch (error: any) {
+      if (error?.code === "ESRCH") monitor.processGroupGone = true
+      // Only ESRCH proves the old group is gone. Preserve cleanup for EPERM
+      // and other transient/host-specific failures.
+      return true
+    }
+  }
+
+  private async waitForGroupGone(monitor: LiveMonitor, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    while (this.processGroupExists(monitor) && Date.now() < deadline) {
+      await this.delay(Math.min(25, Math.max(1, deadline - Date.now())))
+    }
+    return !this.processGroupExists(monitor)
+  }
+
+  private delay(milliseconds: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, milliseconds))
   }
 
   private settleWaiters(monitor: LiveMonitor, reason: "ready" | "completed" | "disposed"): void {

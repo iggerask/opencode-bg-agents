@@ -66,4 +66,42 @@ describe("TaskStore", () => {
     expect(store.linkNativeChild("a", "other")).toBeUndefined()
     store.close()
   })
+
+  test("keeps a consumed cancelled dispatch leased until late child metadata is linked", async () => {
+    const store = new TaskStore(await databasePath())
+    store.createTask(task("race"))
+    const claim = store.claimTaskIfEligible("race", 1)!
+    expect(store.consumeDispatchToken("race", claim.token)).toBe(true)
+    store.transitionTask("race", "cancelled", "cancel won")
+    expect(store.releaseLeases("race")).toBe(0)
+    const linked = store.linkNativeChild("race", "late-child")
+    expect(linked).toMatchObject({ state: "cancelled", nativeSessionId: "late-child" })
+    expect(store.releaseLeases("race")).toBe(1)
+    store.close()
+  })
+
+  test("recovers an unconsumed expired dispatch atomically before a new claim", async () => {
+    const store = new TaskStore(await databasePath())
+    store.createTask(task("expired"))
+    store.createTask(task("next"))
+    const expired = store.claimTaskIfEligible("expired", 1)!
+    store.db.query("UPDATE tasks SET dispatch_token_issued_at = ? WHERE id = ?").run(Date.now() - 6 * 60 * 1000, "expired")
+    const next = store.claimTaskIfEligible("next", 1)
+    expect(next?.task.id).toBe("next")
+    expect(store.getTask("expired")).toMatchObject({ state: "queued", dispatchToken: undefined })
+    expect(store.listLeases("expired")).toEqual([])
+    // The expired capability cannot be consumed after recovery.
+    expect(store.consumeDispatchToken("expired", expired.token)).toBe(false)
+    store.close()
+  })
+
+  test("serializes fresh-schema migration across two open stores", async () => {
+    const path = await databasePath()
+    const first = new TaskStore(path)
+    const second = new TaskStore(path)
+    first.createTask(task("first"))
+    expect(second.getTask("first")?.id).toBe("first")
+    second.close()
+    first.close()
+  })
 })

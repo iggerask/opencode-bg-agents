@@ -5,6 +5,37 @@ import * as path from "node:path"
 import { createValidationRunner } from "../src/validation"
 
 const temporaryDirectories: string[] = []
+const descendantPids: number[] = []
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error: any) {
+    return error?.code !== "ESRCH"
+  }
+}
+
+async function waitForPid(filePath: string): Promise<number> {
+  const deadline = Date.now() + 1000
+  while (Date.now() < deadline) {
+    try {
+      const pid = Number(await fs.readFile(filePath, "utf8"))
+      if (Number.isInteger(pid) && pid > 0) return pid
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  throw new Error("descendant PID was not written")
+}
+
+async function eventually(predicate: () => boolean, timeoutMs = 1500): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  return predicate()
+}
 
 async function workspace() {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "validation-runner-"))
@@ -15,6 +46,9 @@ async function workspace() {
 }
 
 afterEach(async () => {
+  for (const pid of descendantPids.splice(0)) {
+    try { process.kill(pid, "SIGKILL") } catch {}
+  }
   await Promise.all(temporaryDirectories.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true })))
 })
 
@@ -55,6 +89,44 @@ test("aborts a validation", async () => {
   clearTimeout(timer)
 
   expect(result.state).toBe("aborted")
+})
+
+test.if(process.platform === "linux" && Boolean((Bun as any).which?.("setsid")))("escalates timeout cleanup after a shell leader exits", async () => {
+  const { root, logs } = await workspace()
+  const pidPath = path.join(root, "descendant.pid")
+  const command = `(trap '' TERM; exec sleep 3) >/dev/null 2>&1 & echo $! > ${JSON.stringify(pidPath)}; trap 'exit 0' TERM; while :; do sleep 1; done`
+  const [result] = await createValidationRunner({ worktree: root, stateDir: logs, timeoutMs: 500 }).run([command])
+  const pid = await waitForPid(pidPath)
+  descendantPids.push(pid)
+
+  expect(result.state).toBe("timeout")
+  expect(await eventually(() => !processExists(pid))).toBe(true)
+})
+
+test.if(process.platform === "linux" && Boolean((Bun as any).which?.("setsid")))("escalates abort cleanup after a shell leader exits", async () => {
+  const { root, logs } = await workspace()
+  const pidPath = path.join(root, "descendant.pid")
+  const controller = new AbortController()
+  const command = `(trap '' TERM; exec sleep 2) >/dev/null 2>&1 & echo $! > ${JSON.stringify(pidPath)}; trap 'exit 0' TERM; while :; do sleep 1; done`
+  const running = createValidationRunner({ worktree: root, stateDir: logs }).run([command], { signal: controller.signal })
+  // If setup fails before the child reports its PID, abort in finally and wait
+  // for the runner's bounded cleanup rather than leaving a live test promise.
+  void running.catch(() => {})
+  try {
+    const pid = await waitForPid(pidPath)
+    descendantPids.push(pid)
+    controller.abort()
+    const [result] = await running
+
+    expect(result.state).toBe("aborted")
+    expect(await eventually(() => !processExists(pid))).toBe(true)
+  } finally {
+    if (!controller.signal.aborted) controller.abort()
+    await Promise.race([
+      running.catch(() => undefined),
+      new Promise<void>((resolve) => setTimeout(resolve, 1500)),
+    ])
+  }
 })
 
 test("truncates returned output while retaining the complete log", async () => {

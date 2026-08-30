@@ -184,8 +184,10 @@ export class ValidationRunner {
     }
 
     let proc: ReturnType<typeof Bun.spawn>
+    let hasProcessGroup = false
     try {
       const setsid = process.platform === "linux" ? (Bun as any).which?.("setsid") : undefined
+      hasProcessGroup = Boolean(setsid)
       proc = Bun.spawn(setsid ? [setsid, "bash", "-lc", command] : ["bash", "-lc", command], {
         cwd,
         stdout: "pipe",
@@ -221,32 +223,67 @@ export class ValidationRunner {
     }
 
     let exited = false
+    let processGroupGone = !hasProcessGroup
     const exitedPromise = proc.exited.then((exitCode: number) => {
       exited = true
       return exitCode
     })
     let stopState: "timeout" | "aborted" | undefined
     let killTimer: ReturnType<typeof setTimeout> | undefined
+    let groupCleanup: Promise<void> | undefined
+    const delay = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds))
+    const groupExists = () => {
+      if (!hasProcessGroup || processGroupGone) return false
+      try {
+        process.kill(-proc.pid, 0)
+        return true
+      } catch (error: any) {
+        if (error?.code === "ESRCH") processGroupGone = true
+        // Only ESRCH proves the old group is gone. Keep trying cleanup for
+        // EPERM and other transient/host-specific failures.
+        return true
+      }
+    }
+    const waitForGroupGone = async (timeout: number) => {
+      const deadline = Date.now() + timeout
+      while (groupExists() && Date.now() < deadline) {
+        await delay(Math.min(25, Math.max(1, deadline - Date.now())))
+      }
+    }
+    const kill = (signal: "SIGTERM" | "SIGKILL") => {
+      if (hasProcessGroup && !processGroupGone) {
+        try {
+          process.kill(-proc.pid, signal)
+          return
+        } catch (error: any) {
+          if (error?.code === "ESRCH") processGroupGone = true
+        }
+      }
+      // Do not signal a leader PID after it has exited: a reused PID could be
+      // unrelated. Non-Linux/direct-process execution retains this fallback.
+      if (!exited) {
+        try { proc.kill(signal) } catch {}
+      }
+    }
     const stop = (state: "timeout" | "aborted") => {
       if (exited || stopState) return
       stopState = state
       // With setsid, the child is a process-group leader. Kill the group first
       // so shell grandchildren cannot keep the output pipes open.
-      try {
-        process.kill(-proc.pid, "SIGTERM")
-      } catch {}
-      try {
-        proc.kill()
-      } catch {}
-      killTimer = setTimeout(() => {
-        if (exited) return
-        try {
-          process.kill(-proc.pid, "SIGKILL")
-        } catch {}
-        try {
-          proc.kill("SIGKILL")
-        } catch {}
-      }, 500)
+      kill("SIGTERM")
+      if (hasProcessGroup) {
+        // This deliberately does not depend on `exited`: SIGTERM may make the
+        // shell leader exit while descendants in its setsid group ignore it.
+        groupCleanup = (async () => {
+          await delay(500)
+          // Signal directly: probing before SIGKILL leaves a PGID-reuse race.
+          // kill() records ESRCH and avoids any later group signal once gone.
+          kill("SIGKILL")
+          await waitForGroupGone(250)
+        })()
+      } else {
+        killTimer = setTimeout(() => kill("SIGKILL"), 500)
+      }
     }
     const onAbort = () => stop("aborted")
     if (signal?.aborted) stop("aborted")
@@ -255,8 +292,19 @@ export class ValidationRunner {
 
     let logClosed = false
     try {
-      const results: [number, void, void] = await Promise.all([exitedPromise, pump(proc.stdout as ReadableStream<Uint8Array> | null), pump(proc.stderr as ReadableStream<Uint8Array> | null)])
-      const exitCode = results[0]
+      const pumps = Promise.all([pump(proc.stdout as ReadableStream<Uint8Array> | null), pump(proc.stderr as ReadableStream<Uint8Array> | null)])
+      // Observe errors now; we still surface them below for ordinary command
+      // completion, while forced cleanup must not become an unhandled reject.
+      void pumps.catch(() => {})
+      const exitCode = await exitedPromise
+      // If stop was requested, wait for group cleanup even when the shell and
+      // pipes have already exited. Otherwise a redirected TERM-ignoring child
+      // could outlive the returned timeout/abort result.
+      await groupCleanup
+      // A killed process group should close its pipes. Bound a pathological
+      // drain after cleanup so timeout/abort cannot wait forever on a stream.
+      if (groupCleanup) await Promise.race([Promise.allSettled([pumps]), delay(250)])
+      else await pumps
       await this.closeLog(log, writing)
       logClosed = true
       if (logError) throw logError
@@ -273,9 +321,12 @@ export class ValidationRunner {
       if (killTimer) clearTimeout(killTimer)
       signal?.removeEventListener("abort", onAbort)
       if (!exited) {
-        try { process.kill(-proc.pid, "SIGKILL") } catch {}
-        try { proc.kill("SIGKILL") } catch {}
+        kill("SIGKILL")
         await exitedPromise.catch(() => {})
+      }
+      if (hasProcessGroup && !processGroupGone) {
+        kill("SIGKILL")
+        await waitForGroupGone(250)
       }
       if (!logClosed) await this.closeLog(log, writing).catch(() => {})
     }

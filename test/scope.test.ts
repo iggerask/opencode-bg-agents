@@ -23,6 +23,13 @@ describe("write scopes", () => {
     expect(scopesConflict("src", "docs")).toBe(false)
   })
 
+  test("uses one canonical identity for direct and symlinked roots", async () => {
+    const root = await worktree()
+    await mkdir(join(root, "docs"))
+    await symlink("docs", join(root, "alias"))
+    expect(await canonicalizeWriteRoots(root, ["alias", "docs"])).toEqual(["docs"])
+  })
+
   test("rejects absolute, escaping, protected, and symlink-escaping roots", async () => {
     const root = await worktree()
     const outside = await mkdtemp(join(tmpdir(), "native-orch-outside-"))
@@ -31,6 +38,24 @@ describe("write scopes", () => {
     for (const value of ["/tmp/nope", "../nope", ".git/config", ".opencode/bg/tasks.sqlite", "escape/output"]) {
       await expect(canonicalizeWriteRoots(root, [value])).rejects.toBeInstanceOf(ScopeError)
     }
+  })
+
+  test("rejects physical aliases to protected directories and their ancestors", async () => {
+    const root = await worktree()
+    await symlink(".opencode/bg", join(root, "state"))
+    await symlink(".opencode", join(root, "opencode-state"))
+    await symlink(".git", join(root, "git-state"))
+
+    for (const value of ["state", "state/tasks.sqlite", "opencode-state", "git-state"]) {
+      await expect(canonicalizeWriteRoots(root, [value])).rejects.toBeInstanceOf(ScopeError)
+    }
+  })
+
+  test("rejects physical aliases to configured plugin state", async () => {
+    const root = await worktree()
+    await mkdir(join(root, "plugin", "state"), { recursive: true })
+    await symlink("plugin/state", join(root, "state"))
+    await expect(canonicalizeWriteRoots(root, ["state"], { pluginStateDir: "plugin/state" })).rejects.toBeInstanceOf(ScopeError)
   })
 
   test("uses physical containment for a symlinked candidate", async () => {

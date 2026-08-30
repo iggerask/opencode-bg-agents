@@ -77,14 +77,18 @@ export class TaskStore {
   }
 
   private migrate(): void {
-    this.db.exec("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)")
-    const version = this.db.query("SELECT MAX(version) AS version FROM schema_migrations").get() as Row
-    if ((version?.version ?? 0) >= 2) return
-    if ((version?.version ?? 0) === 1) {
-      this.db.query("INSERT INTO schema_migrations(version, applied_at) VALUES(2, ?)").run(now())
-      return
-    }
-    this.db.exec(`
+    // DDL is transactional in SQLite.  Taking the write lock before looking at
+    // the version prevents two freshly-created plugin instances from both
+    // observing an empty migration table and racing their CREATE statements.
+    this.immediate(() => {
+      this.db.exec("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)")
+      const version = this.db.query("SELECT MAX(version) AS version FROM schema_migrations").get() as Row
+      if ((version?.version ?? 0) >= 2) return
+      if ((version?.version ?? 0) === 1) {
+        this.db.query("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, ?)").run(now())
+        return
+      }
+      this.db.exec(`
       CREATE TABLE tasks (
         id TEXT PRIMARY KEY, state TEXT NOT NULL CHECK (state IN (${TASK_STATES.map((s) => `'${s}'`).join(",")})),
         root_session_id TEXT NOT NULL, parent_session_id TEXT, native_session_id TEXT, native_job_id TEXT,
@@ -113,7 +117,8 @@ export class TaskStore {
       CREATE INDEX task_events_task_at ON task_events(task_id, at);
       CREATE INDEX tasks_state_created ON tasks(state, created_at);
     `)
-    this.db.query("INSERT INTO schema_migrations(version, applied_at) VALUES(1, ?), (2, ?)").run(now(), now())
+      this.db.query("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, ?), (2, ?)").run(now(), now())
+    })
   }
 
   /** SQLite writes use BEGIN IMMEDIATE so independent plugin instances serialize claims. */
@@ -190,7 +195,7 @@ export class TaskStore {
     const values: any[] = [next, at]
     if (next === "ready") { columns.push("ready_at = ?", "blocked_reason = NULL"); values.push(at) }
     if (next === "starting") { columns.push("started_at = ?", "blocked_reason = NULL", "finished_at = NULL", "error = NULL"); values.push(at) }
-    if ((TERMINAL_TASK_STATES as readonly TaskState[]).includes(next)) {
+    if ((TERMINAL_TASK_STATES as readonly TaskState[]).includes(next) && !(task.state === "starting" && task.dispatchTokenConsumedAt && !task.nativeSessionId)) {
       columns.push("finished_at = ?", "dispatch_token = NULL", "dispatch_token_issued_at = NULL", "dispatch_token_consumed_at = NULL")
       values.push(at)
     }
@@ -215,7 +220,7 @@ export class TaskStore {
       const fields = new Map<string, unknown>([["state", next], ["updated_at", at]])
       if (next === "ready") { fields.set("ready_at", at); fields.set("blocked_reason", null) }
       if (next === "starting") { fields.set("started_at", at); fields.set("blocked_reason", null); fields.set("finished_at", null); fields.set("error", null) }
-      if ((TERMINAL_TASK_STATES as readonly TaskState[]).includes(next)) {
+      if ((TERMINAL_TASK_STATES as readonly TaskState[]).includes(next) && !(task.state === "starting" && task.dispatchTokenConsumedAt && !task.nativeSessionId)) {
         fields.set("finished_at", at); fields.set("dispatch_token", null); fields.set("dispatch_token_issued_at", null); fields.set("dispatch_token_consumed_at", null)
       }
       const patchFields: [string, unknown][] = [
@@ -278,8 +283,40 @@ export class TaskStore {
   }
 
   releaseLeases(taskId: string): number {
-    const tx = () => this.immediate(() => this.releaseLeasesUnchecked(taskId))
+    const tx = () => this.immediate(() => {
+      const task = this.requireTask(taskId)
+      // A token was accepted but the task hook has not supplied the child ID.
+      // Keep the lease until that hook either links/aborts the child or rolls
+      // back; otherwise a cancelled child could overlap a new writer.
+      if (task.dispatchTokenConsumedAt && !task.nativeSessionId) return 0
+      return this.releaseLeasesUnchecked(taskId)
+    })
     return tx()
+  }
+
+  /**
+   * Release only a cancellation that was first made indeterminate, then
+   * explicitly resolved by the root.  A direct cancellation while a consumed
+   * task after-hook is still pending retains its token and is intentionally
+   * ineligible for this escape hatch.
+   */
+  releaseResolvedUnlinkedCancellation(taskId: string): number {
+    return this.immediate(() => {
+      const task = this.requireTask(taskId)
+      if (task.state !== "cancelled" || task.nativeSessionId || task.dispatchToken || task.dispatchTokenIssuedAt || task.dispatchTokenConsumedAt) return 0
+      return this.releaseLeasesUnchecked(taskId)
+    })
+  }
+
+  /** Mark that an after-hook completed without yielding an authenticated child. */
+  markUnlinkedDispatchResolved(taskId: string): boolean {
+    return this.immediate(() => {
+      const task = this.requireTask(taskId)
+      if (!(["interrupted", "cancelled"] as TaskState[]).includes(task.state) || task.nativeSessionId || !task.dispatchTokenConsumedAt) return false
+      const result = this.db.query("UPDATE tasks SET dispatch_token = NULL, dispatch_token_issued_at = NULL, dispatch_token_consumed_at = NULL, updated_at = ? WHERE id = ? AND native_session_id IS NULL AND dispatch_token_consumed_at IS NOT NULL").run(now(), taskId)
+      if (result.changes) this.event(taskId, "unlinked_dispatch_resolved")
+      return result.changes === 1
+    })
   }
 
   private releaseLeasesUnchecked(taskId: string): number {
@@ -295,6 +332,7 @@ export class TaskStore {
 
   consumeDispatchToken(taskId: string, token: string): boolean {
     const tx = () => this.immediate(() => {
+      this.recoverExpiredDispatchesUnchecked()
       const at = now()
       const result = this.db.query("UPDATE tasks SET dispatch_token_consumed_at = ?, updated_at = ? WHERE id = ? AND state = 'starting' AND dispatch_token = ? AND dispatch_token_consumed_at IS NULL AND dispatch_token_issued_at >= ?").run(at, at, taskId, token, at - DISPATCH_TOKEN_TTL_MS)
       if (result.changes) this.event(taskId, "dispatch_token_consumed")
@@ -306,10 +344,29 @@ export class TaskStore {
   /** Atomically associate the child only after the native task call consumed its token. */
   linkNativeChild(id: string, nativeSessionId: string, nativeJobId?: string): Task | undefined {
     return this.immediate(() => {
+      const task = this.requireTask(id)
+      if (!task.dispatchTokenConsumedAt) return undefined
       const at = now()
-      const linked = this.db.query("UPDATE tasks SET native_session_id = ?, native_job_id = ?, state = 'running', updated_at = ? WHERE id = ? AND state = 'starting' AND dispatch_token_consumed_at IS NOT NULL").run(nativeSessionId, nativeJobId ?? null, at, id)
+      // Continuations deliberately resume the same native session.  Do not
+      // overwrite that durable identity, but do complete the starting ->
+      // running handshake for the fresh dispatch.
+      if (task.nativeSessionId) {
+        if (task.nativeSessionId !== nativeSessionId || task.state !== "starting") return undefined
+        const resumed = this.db.query("UPDATE tasks SET native_job_id = ?, state = 'running', updated_at = ? WHERE id = ? AND state = 'starting' AND dispatch_token_consumed_at IS NOT NULL").run(nativeJobId ?? task.nativeJobId ?? null, at, id)
+        if (resumed.changes !== 1) return undefined
+        this.event(id, "native_child_resumed", "starting", "running", nativeSessionId)
+        return this.getTask(id)!
+      }
+      // Cancellation can win after the native task endpoint accepted its
+      // token but before this after-hook receives the child metadata.  Record
+      // that child even in a terminal state so write hooks can deny it and the
+      // caller can abort it.  A still-starting task becomes normally running.
+      const terminal = (TERMINAL_TASK_STATES as readonly TaskState[]).includes(task.state)
+      const linked = this.db.query(`UPDATE tasks SET native_session_id = ?, native_job_id = ?, state = ?,
+        dispatch_token = ${terminal ? "NULL" : "dispatch_token"}, dispatch_token_issued_at = ${terminal ? "NULL" : "dispatch_token_issued_at"}, dispatch_token_consumed_at = ${terminal ? "NULL" : "dispatch_token_consumed_at"}, updated_at = ?
+        WHERE id = ? AND native_session_id IS NULL AND dispatch_token_consumed_at IS NOT NULL`).run(nativeSessionId, nativeJobId ?? null, task.state === "starting" ? "running" : task.state, at, id)
       if (linked.changes !== 1) return undefined
-      this.event(id, "native_child_linked", "starting", "running", nativeSessionId)
+      this.event(id, "native_child_linked", task.state, task.state === "starting" ? "running" : task.state, nativeSessionId)
       return this.getTask(id)!
     })
   }
@@ -342,6 +399,7 @@ export class TaskStore {
   claimOldestDispatchable(capacity: number): DispatchClaim | undefined {
     if (!Number.isInteger(capacity) || capacity < 1) throw new Error("capacity must be a positive integer")
     const tx = () => this.immediate(() => {
+      this.recoverExpiredDispatchesUnchecked()
       if (this.activeCount() >= capacity) return undefined
       const candidates = this.listTasks(["queued", "ready", "blocked"])
       for (const task of candidates) {
@@ -376,6 +434,7 @@ export class TaskStore {
   claimTaskIfEligible(id: string, capacity: number): DispatchClaim | undefined {
     if (!Number.isInteger(capacity) || capacity < 1) throw new Error("capacity must be a positive integer")
     const tx = () => this.immediate(() => {
+      this.recoverExpiredDispatchesUnchecked()
       const task = this.requireTask(id)
       const dependencyBlocked = task.state === "blocked" && task.blockedReason?.startsWith("dependency ")
       if (!(dependencyBlocked || (["queued", "ready"] as TaskState[]).includes(task.state)) || this.activeCount() >= capacity) return undefined
@@ -404,6 +463,7 @@ export class TaskStore {
   /** Reserve a retry against the same native session, with fresh leases and token. */
   claimContinuation(id: string, capacity: number, prompt?: string): DispatchClaim | undefined {
     const tx = () => this.immediate(() => {
+      this.recoverExpiredDispatchesUnchecked()
       const task = this.requireTask(id)
       if (!task.nativeSessionId || !(["blocked", "failed", "interrupted"] as TaskState[]).includes(task.state) || this.activeCount() >= capacity) return undefined
       const lease = this.acquireLeasesUnchecked(id, task.writeRoots)
@@ -428,6 +488,22 @@ export class TaskStore {
       return this.requireTask(id)
     })
     return tx()
+  }
+
+  /** Recover claims whose one-use capability was never consumed. */
+  recoverExpiredDispatches(): number {
+    return this.immediate(() => this.recoverExpiredDispatchesUnchecked())
+  }
+
+  private recoverExpiredDispatchesUnchecked(): number {
+    const expired = this.db.query("SELECT id FROM tasks WHERE state = 'starting' AND dispatch_token_consumed_at IS NULL AND dispatch_token_issued_at IS NOT NULL AND dispatch_token_issued_at < ?").all(now() - DISPATCH_TOKEN_TTL_MS) as Row[]
+    for (const row of expired) {
+      this.transitionUnchecked(row.id, "queued", "dispatch token expired before native task start")
+      this.db.query("UPDATE tasks SET dispatch_token = NULL, dispatch_token_issued_at = NULL, dispatch_token_consumed_at = NULL, updated_at = ? WHERE id = ?").run(now(), row.id)
+      this.releaseLeasesUnchecked(row.id)
+      this.event(row.id, "dispatch_expired")
+    }
+    return expired.length
   }
 
   findByNativeSession(sessionId: string): Task | undefined {

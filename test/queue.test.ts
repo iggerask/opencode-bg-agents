@@ -65,4 +65,20 @@ describe("TaskQueue", () => {
     expect(failed.getTask("blocked")).toMatchObject({ state: "blocked", blockedReason: "dependency bad is failed" })
     failed.close()
   })
+
+  test("reconsiders a dependency-blocked task after its prerequisite recovers", async () => {
+    const store = await storeForTest()
+    create(store, "dependency", ["dep"])
+    create(store, "dependent", ["child"], ["dependency"])
+    store.transitionTask("dependency", "failed")
+    const queue = new TaskQueue(store, { capacity: 1 })
+    expect(queue.claim("dependent")).toBeUndefined()
+    expect(store.getTask("dependent")).toMatchObject({ state: "blocked", blockedReason: "dependency dependency is failed" })
+    // A continuation/retry may recover a failed prerequisite.
+    store.transitionTask("dependency", "starting")
+    store.transitionTask("dependency", "running")
+    store.transitionTask("dependency", "done")
+    expect(queue.claim("dependent")?.task.id).toBe("dependent")
+    store.close()
+  })
 })
