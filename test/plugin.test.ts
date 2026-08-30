@@ -1,0 +1,184 @@
+import { afterEach, describe, expect, test } from "bun:test"
+import * as fs from "node:fs/promises"
+import * as path from "node:path"
+import { BackgroundAgents } from "../src/index"
+import { TaskStore } from "../src/store"
+import { context, pluginFixture, text } from "./fixtures"
+
+const cleanups: (() => Promise<void>)[] = []
+afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup() })
+
+async function setup(options: any = {}) {
+  const fixture = await pluginFixture(); cleanups.push(fixture.cleanup)
+  const hooks: any = await BackgroundAgents({ client: fixture.client, directory: fixture.root, worktree: fixture.root } as any, { notifications: false, __backgroundSubagents: true, ...options })
+  cleanups.push(async () => hooks.dispose())
+  return { ...fixture, hooks, ctx: context("root", fixture.root, "orchestrator", fixture.calls) }
+}
+
+function argsFrom(result: any) { return JSON.parse(text(result)) }
+const nativeMetadata = (sessionId: string) => ({ sessionId, parentSessionId: "root", jobId: `job-${sessionId}`, background: true })
+
+describe("native orchestration plugin", () => {
+  test("prepare returns native task args and hooks consume/inject/link", async () => {
+    const { hooks, ctx } = await setup()
+    const prepared = await hooks.tool.orch_prepare.execute({ title: "Implement thing", prompt: "Do it", agent: "implement", write_roots: ["src"] }, ctx)
+    const native = argsFrom(prepared)
+    expect(native).toMatchObject({ description: "Implement thing", prompt: "Do it", subagent_type: "implement", background: true })
+    expect(native.command).toMatch(/^orch:orch_/)
+    const before = { args: { ...native } }
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "call" }, before)
+    expect(before.args.prompt).toContain("Use orch_complete exactly once")
+    await expect(hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "again" }, { args: native })).rejects.toThrow("already used")
+    const after = { output: "started", metadata: nativeMetadata("child") }
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "call", args: native }, after)
+    expect(text(await hooks.tool.orch_status.execute({}, ctx))).toContain("native=child")
+    expect(after.metadata).toEqual(nativeMetadata("child"))
+  })
+
+  test("overlapping roots queue and completion validation unlocks next", async () => {
+    const { hooks, ctx, calls } = await setup()
+    const first = argsFrom(await hooks.tool.orch_prepare.execute({ title: "one", prompt: "one", agent: "implement", write_roots: ["src"], validations: ["true"] }, ctx))
+    const secondResult = await hooks.tool.orch_prepare.execute({ title: "two", prompt: "two", agent: "implement", write_roots: ["src/sub"] }, ctx)
+    expect(argsFrom(secondResult).queued).toBe(true)
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "a" }, { args: first })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "a", args: first }, { output: "", metadata: nativeMetadata("child") })
+    expect(await hooks.tool.orch_complete.execute({ status: "done", summary: "ok", files_changed: [] }, context("child", ctx.worktree, "implement", calls))).toContain("completed")
+    expect(calls.asks).toEqual([
+      { permission: "bash", patterns: ["true"], always: [], metadata: { operation: "orch_prepare", title: "one" } },
+      { permission: "bash", patterns: ["true"], always: [], metadata: { operation: "orch_complete_validation", taskId: first.command.split(":")[1] } },
+    ])
+    const next = argsFrom(await hooks.tool.orch_start.execute({}, ctx))
+    expect(next.description).toBe("two")
+  })
+
+  test("validation failures restore running and blocked work returns continuation args", async () => {
+    const { hooks, ctx } = await setup()
+    const failing = argsFrom(await hooks.tool.orch_prepare.execute({ title: "validate", prompt: "validate", agent: "implement", write_roots: ["src"], validations: ["printf nope; exit 2"] }, ctx))
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "v" }, { args: failing })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "v", args: failing }, { output: "", metadata: nativeMetadata("validation-child") })
+    const failed = await hooks.tool.orch_complete.execute({ status: "done", summary: "done", files_changed: [] }, context("validation-child", ctx.worktree, "implement"))
+    expect(failed).toContain("Validation failed")
+    expect(text(await hooks.tool.orch_status.execute({}, ctx))).toContain("[running]")
+    const id = failing.command.split(":")[1]
+    expect(await hooks.tool.orch_complete.execute({ status: "blocked", summary: "need input", question: "which?" }, context("validation-child", ctx.worktree, "implement"))).toContain("blocked")
+    const continued = argsFrom(await hooks.tool.orch_continue.execute({ id, message: "use A" }, ctx))
+    expect(continued).toMatchObject({ task_id: "validation-child", background: true })
+    expect(continued.prompt).toBe("validate\n\nContinuation request: use A")
+    expect(continued.command).toMatch(new RegExp(`^orch:${id}:`))
+    expect(await hooks.tool.orch_continue.execute({ id, message: "use B" }, ctx)).toContain("cannot continue yet")
+    const continuationBefore = { args: { ...continued } }
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "continued" }, continuationBefore)
+    expect(continuationBefore.args.prompt).toContain("Continuation request: use A")
+    await expect(hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "continued-again" }, { args: continued })).rejects.toThrow("already used")
+  })
+
+  test("write enforcement parses apply_patch and terminal child events fail missing completion", async () => {
+    const { hooks, ctx } = await setup()
+    const native = argsFrom(await hooks.tool.orch_prepare.execute({ title: "scope", prompt: "scope", agent: "implement", write_roots: ["src"] }, ctx))
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "a" }, { args: native })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "a", args: native }, { output: "", metadata: nativeMetadata("child") })
+    await hooks["tool.execute.before"]({ tool: "apply_patch", sessionID: "child", callID: "ok" }, { args: { patchText: "*** Add File: src/a.ts" } })
+    await expect(hooks["tool.execute.before"]({ tool: "apply_patch", sessionID: "child", callID: "bad" }, { args: { patchText: "*** Update File: README.md" } })).rejects.toThrow("outside")
+    await hooks.event({ event: { type: "session.status", properties: { sessionID: "child", status: { type: "idle" } } } })
+    expect(text(await hooks.tool.orch_status.execute({}, ctx))).toContain("without orch_complete")
+  })
+
+  test("cancel aborts native child and monitor tools are wired", async () => {
+    const { hooks, ctx, calls } = await setup()
+    const native = argsFrom(await hooks.tool.orch_prepare.execute({ title: "cancel", prompt: "cancel", agent: "implement", write_roots: ["src"] }, ctx))
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "a" }, { args: native })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "a", args: native }, { output: "", metadata: nativeMetadata("child") })
+    const id = native.command.split(":")[1]
+    expect(await hooks.tool.orch_cancel.execute({ id }, ctx)).toContain("Cancelled")
+    expect(calls.abort).toEqual(["child"])
+    const started = await hooks.tool.monitor_run.execute({ command: "printf hi" }, ctx)
+    expect(calls.asks).toEqual([{ permission: "bash", patterns: ["printf hi"], always: [], metadata: { operation: "monitor_run", title: "printf hi" } }])
+    const monitor = /mon_[A-Za-z0-9_-]+/.exec(text(started))![0]
+    expect(text(await hooks.tool.monitor_status.execute({ id: monitor }, ctx))).toContain(monitor)
+    expect(text(await hooks.tool.monitor_wait.execute({ id: monitor, timeout_sec: 2 }, ctx))).toContain("completed")
+    expect(text(await hooks.tool.monitor_read.execute({ id: monitor }, ctx))).toContain("hi")
+  })
+
+  test("setup requests the complete native edit AskInput and unavailable monitors stay honest", async () => {
+    const { hooks, ctx, calls } = await setup()
+    await hooks.tool.bg_setup.execute({}, ctx)
+    expect(calls.asks).toEqual([{
+      permission: "edit",
+      patterns: [path.join(ctx.worktree, ".opencode", "agent", "orchestrator.md"), path.join(ctx.worktree, ".opencode", "command", "bg.md"), path.join(ctx.worktree, ".gitignore")],
+      always: [],
+      metadata: { operation: "bg_setup" },
+    }])
+    const id = "mon_recovered"
+    await fs.writeFile(path.join(ctx.worktree, ".opencode", "bg", `${id}.json`), JSON.stringify({ id, state: "running", title: "old", command: "old", cwd: ctx.worktree, ownerSessionID: "root", startedAt: 1, patternSeen: false, live: true }))
+    expect(await hooks.tool.monitor_kill.execute({ id }, ctx)).toBe(`Monitor ${id} is unavailable after recovery and cannot be controlled.`)
+  })
+
+  test("uses SDK FileDiff records and safely rejects authoritative diff errors", async () => {
+    const { hooks, ctx, client } = await setup()
+    const native = argsFrom(await hooks.tool.orch_prepare.execute({ title: "diff", prompt: "diff", agent: "implement", write_roots: ["src"] }, ctx))
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "diff" }, { args: native })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "diff", args: native }, { output: "", metadata: nativeMetadata("diff-child") })
+    client.session.diff = async () => ({ data: [{ file: "src/a.ts", before: "", after: "x", additions: 1, deletions: 0 }] })
+    expect(await hooks.tool.orch_complete.execute({ status: "done", summary: "ok", files_changed: ["src/a.ts"] }, context("diff-child", ctx.worktree, "implement"))).toContain("completed")
+
+    const malformed = argsFrom(await hooks.tool.orch_prepare.execute({ title: "bad diff", prompt: "bad diff", agent: "implement", write_roots: ["src/b"] }, ctx))
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "bad-diff" }, { args: malformed })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "bad-diff", args: malformed }, { output: "", metadata: nativeMetadata("bad-diff-child") })
+    client.session.diff = async () => ({ error: { message: "no diff" } })
+    expect(await hooks.tool.orch_complete.execute({ status: "done", summary: "no", files_changed: [] }, context("bad-diff-child", ctx.worktree, "implement"))).toContain("returned an error")
+    client.session.diff = async () => ({ data: [{ file: 42 }] })
+    expect(await hooks.tool.orch_complete.execute({ status: "done", summary: "bad", files_changed: [] }, context("bad-diff-child", ctx.worktree, "implement"))).toContain("malformed file entry")
+  })
+
+  test("completion is idempotent and reports cancellation that wins delayed validation", async () => {
+    const { hooks, ctx } = await setup()
+    const native = argsFrom(await hooks.tool.orch_prepare.execute({ title: "race", prompt: "race", agent: "implement", write_roots: ["src"], validations: ["sleep 0.1; true"] }, ctx))
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "race" }, { args: native })
+    await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", callID: "race", args: native }, { output: "", metadata: nativeMetadata("race-child") })
+    const specialist = context("race-child", ctx.worktree, "implement")
+    const first = hooks.tool.orch_complete.execute({ status: "done", summary: "first", files_changed: [] }, specialist)
+    const second = hooks.tool.orch_complete.execute({ status: "done", summary: "second", files_changed: [] }, specialist)
+    const secondResult = await second
+    expect(secondResult).toContain("already being processed")
+    const cancelled = await hooks.tool.orch_cancel.execute({ id: native.command.split(":")[1] }, ctx)
+    expect(cancelled).toContain("Cancelled")
+    expect(await first).toContain("is cancelled")
+    expect(text(await hooks.tool.orch_status.execute({}, ctx))).toContain("[cancelled]")
+  })
+
+  test("capability fallback uses only the upstream boolean runtime flag semantics", async () => {
+    const name = "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS"
+    const previous = process.env[name]
+    const previousBroad = process.env.OPENCODE_EXPERIMENTAL
+    try {
+      process.env.OPENCODE_EXPERIMENTAL = "true"
+      process.env[name] = "false"
+      const disabled = await setup({ __backgroundSubagents: false })
+      expect(text(await disabled.hooks.tool.orch_prepare.execute({ title: "off", prompt: "off", agent: "implement" }, disabled.ctx))).toContain("unavailable")
+
+      process.env[name] = "y"
+      const enabled = await setup({ __backgroundSubagents: false })
+      expect(argsFrom(await enabled.hooks.tool.orch_prepare.execute({ title: "on", prompt: "on", agent: "implement" }, enabled.ctx))).toMatchObject({ description: "on", background: true })
+    } finally {
+      if (previous === undefined) delete process.env[name]
+      else process.env[name] = previous
+      if (previousBroad === undefined) delete process.env.OPENCODE_EXPERIMENTAL
+      else process.env.OPENCODE_EXPERIMENTAL = previousBroad
+    }
+  })
+
+  test("startup reconciliation accepts the SDK session.status map", async () => {
+    const fixture = await pluginFixture(); cleanups.push(fixture.cleanup)
+    const stateDir = path.join(fixture.root, ".opencode", "bg")
+    await fs.mkdir(stateDir, { recursive: true })
+    const store = new TaskStore(path.join(stateDir, "tasks.sqlite"))
+    store.createTask({ id: "recovered", state: "running", rootSessionId: "root", prompt: "recover", agent: "implement", title: "recover", writeRoots: [] })
+    store.updateTask("recovered", { nativeSessionId: "child" })
+    store.close()
+    fixture.client.session.status = async () => ({ data: { child: { type: "busy" } } })
+    const hooks: any = await BackgroundAgents({ client: fixture.client, directory: fixture.root, worktree: fixture.root } as any, { notifications: false, __backgroundSubagents: true })
+    cleanups.push(async () => hooks.dispose())
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(text(await hooks.tool.orch_status.execute({}, context("root", fixture.root, "orchestrator", fixture.calls)))).toContain("recovered [running]")
+  })
+})
