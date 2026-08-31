@@ -4,10 +4,20 @@
   "description": "Native OpenCode background-task orchestration, completion gates, and compatible process monitors",
   "main": "src/index.ts",
   "type": "module",
-  "files": ["src", "templates"],
-  "keywords": ["opencode", "opencode-plugin", "background-agents"],
+  "files": [
+    "src",
+    "templates"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "background-agents"
+  ],
   "license": "MIT",
-  "repository": "github:iggerask/opencode-bg-agents",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iggerask/opencode-bg-agents.git"
+  },
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit"
